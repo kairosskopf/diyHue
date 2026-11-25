@@ -84,6 +84,22 @@ class MqttBaseTopicTests(unittest.TestCase):
         self.assertIn("hue/bridge/log", topics)
         self.assertNotIn("zigbee2mqtt/bridge/devices", topics)
 
+    def test_dimmer_discovery_without_lamps_or_plugs(self):
+        self.config["config"]["mqtt"]["discoverLights"] = False
+        client = Mock()
+        mqtt.on_connect(client, None, None, 0)
+        topics = [call.args[0] for call in client.subscribe.call_args_list]
+        self.assertCountEqual(topics, ["zigbee2mqtt/+", "zigbee2mqtt/bridge/devices",
+                                       "zigbee2mqtt/bridge/log"])
+        with patch.object(mqtt, "on_autodiscovery_light") as import_light:
+            self.discover("homeassistant/light/bulb/light/config", {})
+            self.discover("homeassistant/switch/plug/switch/config", {})
+            import_light.assert_not_called()
+        self.discover("zigbee2mqtt/bridge/devices", [
+            device("RWL021", "office dimmer", "0x0017880100000011"),
+        ])
+        self.assertIn("office dimmer", self.sensor_names())
+
     def test_light_discovery_publishes_to_configured_base_topic(self):
         from lights.protocols import mqtt as light_mqtt
         mqtt_config = {

@@ -36,6 +36,10 @@ discoveredDevices = {}
 DEFAULT_Z2M_BASE_TOPIC = "zigbee2mqtt"
 
 
+def lightDiscoveryEnabled():
+    return bridgeConfig["config"]["mqtt"].get("discoverLights", True)
+
+
 def getBaseTopic():
     """Return the Zigbee2MQTT base topic (config mqtt.baseTopic, default "zigbee2mqtt")."""
     mqtt_config = (bridgeConfig.get("config") or {}).get("mqtt") or {}
@@ -352,7 +356,8 @@ def on_message(client, userdata, msg):
                 # Zigbee2MQTT announces sockets (smart plugs) as HA switch
                 # entities; they carry the same command/state topics as a light,
                 # so the light path turns them into a Hue on/off plug.
-                on_autodiscovery_light(msg)
+                if lightDiscoveryEnabled():
+                    on_autodiscovery_light(msg)
             elif msg.topic == getBaseTopic() + "/bridge/devices":
                 for key in data:
                     if "model_id" in key and (key["model_id"] in standardSensors or key["model_id"] in motionSensors): # Sensor is supported
@@ -541,12 +546,10 @@ def on_connect(client, userdata, flags, rc):
 
     # Subscribing in on_connect() means that if we lose the connection and
     # reconnect then subscriptions will be renewed.
-    # Start autodetection on lights
-    autodiscoveryTopic = discoveryPrefix + "/light/+/light/config" # + in topic is wildcard
+    if lightDiscoveryEnabled():
+        client.subscribe(discoveryPrefix + "/light/+/light/config")
+        client.subscribe(discoveryPrefix + "/switch/+/+/config")
     baseTopic = getBaseTopic()
-    client.subscribe(autodiscoveryTopic)
-    # Zigbee2MQTT announces sockets (smart plugs) as HA "switch" entities.
-    client.subscribe(discoveryPrefix + "/switch/+/+/config")
     client.subscribe(baseTopic + "/+")
     client.subscribe(baseTopic + "/bridge/devices")
     client.subscribe(baseTopic + "/bridge/log")

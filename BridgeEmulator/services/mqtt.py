@@ -1,3 +1,4 @@
+from services.lightReports import apply_report
 import logManager
 import configManager
 import json
@@ -251,14 +252,6 @@ def longPressButton(sensor, buttonevent):
         sleep(0.5)
     return
 
-def streamGroupEvent(device, state):
-    for id, group in bridgeConfig["groups"].items():
-        if id != "0":
-            for light in group.lights:
-                if light().id_v1 == device.id_v1:
-                    group.genStreamEvent(state)
-
-
 def getObject(friendly_name):
     if friendly_name in devices_ids:
         logging.debug("Cache Hit for " + friendly_name)
@@ -506,18 +499,10 @@ def on_message(client, userdata, msg):
                         checkBehaviorInstances(device)
                     elif device.getObjectPath()["resource"] == "lights":
                         state = {"reachable": True}
-                        v2State = {}
-                        if "state" in data:
-                            if data["state"] == "ON":
-                                state["on"] = True
-                            else:
-                                state["on"] = False
-                            v2State.update({"on":{"on": state["on"]}})
-                            device.genStreamEvent(v2State)
-                        if "brightness" in data:
+                        if data.get("state") in ("ON", "OFF"):
+                            state["on"] = data["state"] == "ON"
+                        if isinstance(data.get("brightness"), (int, float)):
                             state["bri"] = data["brightness"]
-                            v2State.update({"dimming": {"brightness": round(state["bri"] / 2.54, 2)}})
-                            device.genStreamEvent(v2State)
                         # Smart plugs report their measurements; keep them in the
                         # light state so the WebUI can show them.
                         for measurement in ("power", "voltage", "current", "energy"):
@@ -526,14 +511,8 @@ def on_message(client, userdata, msg):
                         if "child_lock" in data:
                             # Tuya plugs report LOCK/UNLOCK, some report ON/OFF.
                             state["childlock"] = str(data["child_lock"]).upper() in ("LOCK", "ON", "TRUE")
-                        if "child_lock" in data:
                             state["child_lock"] = data["child_lock"]
-                        if "child_lock" in data:
-                            state["child_lock"] = data["child_lock"]
-                        if "child_lock" in data:
-                            state["child_lock"] = data["child_lock"]
-                        device.state.update(state)
-                        streamGroupEvent(device, v2State)
+                        apply_report(device, state, bridgeConfig["groups"])
 
                 on_state_update(msg)
         except Exception as e:

@@ -160,6 +160,9 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.light.state['bri'], 100)
 
     def test_credential_change_fences_old_callbacks_and_requires_baseline(self):
+        from HueObjects.Light import Light
+        self.light = Light({"id_v1": "1", "modelid": "LCT015", "name": "test",
+                            "protocol": "homeassistant_ws", "protocol_cfg": {"entity_id": "light.test"}})
         cfg = {'homeAssistantEventReflection': True, 'homeAssistantUseHttps': True,
                'homeAssistantIp': 'example.invalid', 'homeAssistantPort': 8123,
                'homeAssistantToken': 'first', 'homeAssistantCaFile': certifi.where()}

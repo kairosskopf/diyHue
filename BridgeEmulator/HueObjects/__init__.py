@@ -1,12 +1,38 @@
 import uuid
 import logManager
 import random
+from collections import deque
+from copy import deepcopy
+from itertools import islice
+from threading import Condition
 
 logging = logManager.logger.get_logger(__name__)
 
-eventstream = []
+eventstream = deque(maxlen=2000)
+_event_condition = Condition()
+_event_sequence = 0
+
+
 def StreamEvent(message):
-    eventstream.append(message)
+    global _event_sequence
+    with _event_condition:
+        eventstream.append(deepcopy(message))
+        _event_sequence += 1
+        _event_condition.notify_all()
+
+
+def event_sequence():
+    with _event_condition:
+        return _event_sequence
+
+
+def events_after(cursor, timeout=15):
+    with _event_condition:
+        _event_condition.wait_for(lambda: _event_sequence > cursor, timeout=timeout)
+        first = _event_sequence - len(eventstream) + 1
+        index = max(0, cursor + 1 - first)
+        return list(enumerate(islice(eventstream, index, None), start=first + index))
+
 
 def v1StateToV2(v1State):
     v2State = {}
@@ -99,6 +125,7 @@ def setGroupAction(group, state, scene=None):
                     continue
             # end limits
             if light().protocol in ["native_multi", "mqtt"]:
+                light().genStreamEvent(v1StateToV2(lightsState[light().id_v1]))
                 if light().protocol_cfg["ip"] not in queueState:
                     queueState[light().protocol_cfg["ip"]] = {
                         "object": light(), "lights": {}}

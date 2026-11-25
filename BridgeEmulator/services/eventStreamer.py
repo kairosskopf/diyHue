@@ -1,32 +1,30 @@
-import logManager
-from flask import Response, stream_with_context, Blueprint
 import json
-from time import sleep, time
-import HueObjects
 
-logging = logManager.logger.get_logger(__name__)
+from flask import Blueprint, Response, request, stream_with_context
+from HueObjects import event_sequence, events_after
+
 stream = Blueprint('stream', __name__)
 
-def messageBroker():
-    while True:
-        if len(HueObjects.eventstream) > 0:
-            for event in HueObjects.eventstream:
-                logging.debug(event)
-            sleep(0.3)  # ensure all devices connected receive the events
-            HueObjects.eventstream = []
-        sleep(0.2)
 
 @stream.route('/eventstream/clip/v2')
 def streamV2Events():
-    def generate():
-        counter = 1000
-        yield f": hi\n\n"
-        while counter > 0:  # ensure we stop at some point
-            if len(HueObjects.eventstream) > 0:
-                for index, messages in enumerate(HueObjects.eventstream):
-                    yield f"id: {int(time()) }:{index}\ndata: {json.dumps([messages], separators=(',', ':'))}\n\n"
-                sleep(0.2)
-            sleep(0.2)
-            counter -= 1
+    from flaskUI.v2restapi import authorizeV2
+    if "user" not in authorizeV2(request.headers):
+        return "", 403
 
-    return Response(stream_with_context(generate()), mimetype='text/event-stream; charset=utf-8')
+    current = event_sequence()
+    cursor = request.headers.get("Last-Event-ID", type=int)
+    if cursor is None or not 0 <= cursor <= current:
+        cursor = current
+
+    def generate(cursor):
+        yield ": hi\n\n"
+        while True:
+            events = events_after(cursor)
+            if not events:
+                yield ": keepalive\n\n"
+            for cursor, message in events:
+                batch = message if isinstance(message, list) else [message]
+                yield f"id: {cursor}\ndata: {json.dumps(batch, separators=(',', ':'))}\n\n"
+
+    return Response(stream_with_context(generate(cursor)), mimetype='text/event-stream')

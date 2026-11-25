@@ -649,7 +649,6 @@ class ClipV2ResourceId(Resource):
             return {"errors": [], "data": [object.getLightlevel()]}
 
     def put(self, resource, resourceid):
-        logging.debug(request.headers)
         authorisation = authorizeV2(request.headers)
         if "user" not in authorisation:
             return "", 403
@@ -657,8 +656,28 @@ class ClipV2ResourceId(Resource):
         logging.info(putDict)
         object = getObject(resource, resourceid)
         if resource == "light":
-            object.setV2State(putDict)
+            from services.homeAssistantWS import MappingUnavailable
+            try:
+                if object.setV2State(putDict) is False:
+                    return {"errors": [{"description": "Light command could not be sent"}], "data": []}, 503
+            except MappingUnavailable:
+                return {"errors": [{"description": "Home Assistant mapping unavailable"}], "data": []}, 503
         elif resource == "entertainment_configuration":
+            if not object:
+                return {"errors": [{"description": "Entertainment configuration not found"}], "data": []}, 404
+            # A layout edit must not alter channels underneath a running stream.
+            edits_layout = any(key in putDict for key in ("metadata", "configuration_type", "locations"))
+            if edits_layout and (object.stream["active"] or "action" in putDict):
+                return {"errors": [{"description": "Stop streaming, then edit the entertainment configuration separately"}], "data": []}, 409
+            try:
+                changed = object.update_configuration(putDict, getObject)
+            except ValueError as error:
+                return {"errors": [{"description": str(error)}], "data": []}, 400
+            if changed:
+                # Done in the Hue app must persist the placement before success
+                # is returned. Use the target branch's existing storage API.
+                configManager.bridgeConfig.save_config(backup=False, resource="groups", blocking=True)
+                object.update_attr({})  # publish the complete, saved v2 layout
             if "action" in putDict:
                 if putDict["action"] == "start":
                     if not object.stream["active"]:
@@ -676,17 +695,96 @@ class ClipV2ResourceId(Resource):
                         proc.kill()
                     object.update_attr({"stream": {"active": False}})
         elif resource == "scene":
+            # Existing scenes are edited through the V2 "actions" list.
+            # Previously this was handled when creating a scene but ignored
+            # on PUT, so edits made in the Hue app did not update lightstates.
+            if "actions" in putDict:
+                lightstates = weakref.WeakKeyDictionary()
+
+                for action in putDict["actions"]:
+                    target = action.get("target", {})
+
+                    if target.get("rtype") != "light":
+                        continue
+
+                    lightObj = getObject(
+                        "light",
+                        target.get("rid")
+                    )
+
+                    if not lightObj:
+                        continue
+
+                    scene = action.get("action", {})
+                    sceneState = {}
+
+                    if "on" in scene:
+                        sceneState["on"] = scene["on"]["on"]
+
+                    if "dimming" in scene:
+                        sceneState["bri"] = int(
+                            scene["dimming"]["brightness"] * 2.54
+                        )
+
+                    if "color" in scene:
+                        if "xy" in scene["color"]:
+                            sceneState["xy"] = [
+                                scene["color"]["xy"]["x"],
+                                scene["color"]["xy"]["y"]
+                            ]
+
+                    if "color_temperature" in scene:
+                        if "mirek" in scene["color_temperature"]:
+                            sceneState["ct"] = (
+                                scene["color_temperature"]["mirek"]
+                            )
+
+                    if "gradient" in scene:
+                        sceneState["gradient"] = scene["gradient"]
+
+                    lightstates[lightObj] = sceneState
+
+                object.lightstates = lightstates
+
+            # Hue scene speed is 0.0..1.0. Apply it BEFORE recall
+            # and propagate changes to an already running dynamic scene.
+            if "speed" in putDict:
+                try:
+                    requested_speed = max(
+                        0.0,
+                        min(1.0, float(putDict["speed"]))
+                    )
+                    object.speed = requested_speed
+
+                    for light_ref in object.lights:
+                        light = light_ref()
+                        if (
+                            light
+                            and light.dynamics["status"]
+                                == "dynamic_palette"
+                        ):
+                            # diyHue's existing scene player divides by
+                            # speed; treat zero as essentially stationary
+                            # rather than raising ZeroDivisionError.
+                            light.dynamics["speed"] = max(
+                                requested_speed,
+                                0.01
+                            )
+                except (TypeError, ValueError):
+                    pass
+
             if "recall" in putDict:
                 object.activate(putDict)
-                if object.group is not None:
+                # Recalling a scene stops a smart scene running on its group
+                if object.group is not None and object.group() is not None:
                     stopSmartScenesOn(object.group())
-            if "speed" in putDict:
-                object.speed = putDict["speed"]
+
             if "palette" in putDict:
                 object.palette = putDict["palette"]
             if "metadata" in putDict:
                 object.name = putDict["metadata"]["name"]
-                configManager.bridgeConfig.mark_dirty("scenes")
+            if any(key in putDict for key in ("metadata", "speed", "palette", "actions")):
+                configManager.bridgeConfig.save_config(backup=False, resource="scenes", blocking=True)
         elif resource == "smart_scene":
             if "recall" in putDict and "action" in putDict["recall"]:
                 object.activate(putDict)

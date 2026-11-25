@@ -38,6 +38,9 @@ def instance(buttons):
 
 class HueDimmerBehaviorTests(unittest.TestCase):
     def setUp(self):
+        patcher = patch.object(behavior_instance, "bridgeConfig", CONFIG)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self._saved = dict(CONFIG)
         self.addCleanup(lambda: (CONFIG.clear(), CONFIG.update(self._saved)))
         self.group = Mock()

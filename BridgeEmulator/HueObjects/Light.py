@@ -168,7 +168,26 @@ class Light():
 
     def _setV1State(self, state, advertise=True):
         if "lights" not in state:
-            state = incProcess(self.state, state)
+            state = incProcess(self.state.copy(), state)
+            if "bri" in state:
+                if "min_bri" in self.protocol_cfg:
+                    state["bri"] = max(state["bri"], self.protocol_cfg["min_bri"])
+                if "max_bri" in self.protocol_cfg:
+                    state["bri"] = min(state["bri"], self.protocol_cfg["max_bri"])
+            if self.protocol == "homeassistant_ws":
+                from lights.protocols import homeassistant_ws
+                from services.homeAssistantWS import MappingUnavailable
+                try:
+                    homeassistant_ws.set_light(self, state)
+                except MappingUnavailable:
+                    raise
+                except Exception as error:
+                    self.state["reachable"] = False
+                    logging.warning("%s light error: %s", self.name, error)
+                    return False
+                self.state["reachable"] = True
+            if state.get("on") is False:
+                self.dynamics["status"] = "none"
             self.updateLightState(state)
             for key, value in state.items():
                 if key in self.state:
@@ -182,13 +201,7 @@ class Light():
                     self.name = value
                 if key == "function":
                     self.function = value
-            if "bri" in state:
-                if "min_bri" in self.protocol_cfg and self.protocol_cfg["min_bri"] > state["bri"]:
-                    state["bri"] = self.protocol_cfg["min_bri"]
-                if "max_bri" in self.protocol_cfg and self.protocol_cfg["max_bri"] < state["bri"]:
-                    state["bri"] = self.protocol_cfg["max_bri"]
-
-        if self.protocol not in ["dummy"]:
+        if self.protocol not in ("dummy", "homeassistant_ws"):
             for protocol in protocols:
                 if "lights.protocols." + self.protocol == protocol.__name__:
                     try:
@@ -197,8 +210,9 @@ class Light():
                     except Exception as e:
                         self.state["reachable"] = False
                         logging.warning(self.name + " light error, details: %s", e)
-                    return
-        if advertise:
+                        return False
+                    break
+        if advertise and "lights" not in state:
             v2State = v1StateToV2(state)
             self.genStreamEvent(v2State)
 
@@ -219,7 +233,8 @@ class Light():
                 v1State["name"] = state["metadata"]["name"]
             if "function" in state["metadata"]:
                 v1State["function"] = state["metadata"]["function"]
-        self.setV1State(v1State, advertise=False)
+        if self.setV1State(v1State, advertise=False) is False:
+            return False
         self.genStreamEvent(state)
 
     def genStreamEvent(self, v2State):
@@ -307,7 +322,7 @@ class Light():
                 ]
             }
             result["gradient"] = {"points": self.state["gradient"]["points"],
-                                  "points_capable": self.protocol_cfg["points_capable"]}
+                                  "points_capable": self.protocol_cfg.get("points_capable", 5)}
 
         # color lights only
         if self.modelid in ["LST002", "LCT001", "LCT015", "LCX002", "915005987201", "LCX004", "LCX006", "LCA005", "LLC010", "LCG001"]:
@@ -490,17 +505,35 @@ class Light():
         logging.debug("Start Dynamic scene play for " + self.name)
         if "dynamic_palette" in self.dynamics["status_values"]:
             self.dynamics["status"] = "dynamic_palette"
-        while self.dynamics["status"] == "dynamic_palette":
-            transition = int(30 / self.dynamics["speed"])
-            logging.debug("using transistiontime " + str(transition))
+        while (
+            self.dynamics["status"] == "dynamic_palette"
+            and self.state.get("on", True)
+        ):
+            try:
+                current_speed = float(self.dynamics["speed"])
+            except (TypeError, ValueError):
+                current_speed = 0.6269841194152832
+
+            # diyHue's existing Hue-like timing model.
+            # Avoid division by zero but otherwise preserve Hue's
+            # incoming dynamics.speed value unchanged.
+            current_speed = max(0.01, current_speed)
+            transition = max(1, int(30 / current_speed))
+
+            logging.debug(
+                "Dynamic scene %s speed %.4f transition %.1fs",
+                self.name,
+                current_speed,
+                transition / 10
+            )
             if self.modelid in ["LCT001", "LCT015", "LST002", "LCX002", "915005987201", "LCX004", "LCX006", "LCA005"]:
-                if index == len(palette["color"]):
+                if index >= len(palette["color"]):
                     index = 0
                 points = []
                 if self.modelid in ["LCX002", "915005987201", "LCX004", "LCX006"]:
                     # for gradient lights
                     gradientIndex = index
-                    for x in range(self.protocol_cfg["points_capable"]):
+                    for x in range(self.protocol_cfg.get("points_capable", 5)):
                         points.append(palette["color"][gradientIndex])
                         gradientIndex += 1
                         if gradientIndex == len(palette["color"]):
@@ -508,23 +541,56 @@ class Light():
                     self.setV2State(
                         {"gradient": {"points": points}, "transitiontime": transition})
                 else:
-                    lightState = palette["color"][index]
+                    lightState = deepcopy(palette["color"][index])
                     # based on youtube videos, the transition is slow
                     lightState["transitiontime"] = transition
                     self.setV2State(lightState)
             elif self.modelid == "LTW001":
-                if index == len(palette["color_temperature"]):
+                if index >= len(palette["color_temperature"]):
                     index = 0
-                lightState = palette["color_temperature"][index]
+                lightState = deepcopy(palette["color_temperature"][index])
                 lightState["transitiontime"] = transition
                 self.setV2State(lightState)
             else:
-                if index == len(palette["dimming"]):
+                if index >= len(palette["dimming"]):
                     index = 0
-                lightState = palette["dimming"][index]
+                lightState = deepcopy(palette["dimming"][index])
                 lightState["transitiontime"] = transition
                 self.setV2State(lightState)
-            sleep(transition / 10)
+            # Wait in short slices instead of one long sleep.
+            # This lets Hue speed changes and OFF commands take effect
+            # immediately instead of after the current transition.
+            remaining = transition / 10
+
+            while (
+                remaining > 0
+                and self.dynamics["status"] == "dynamic_palette"
+                and self.state.get("on", True)
+            ):
+                try:
+                    new_speed = max(
+                        0.01,
+                        float(self.dynamics["speed"])
+                    )
+                except (TypeError, ValueError):
+                    new_speed = current_speed
+
+                # Hue changed the live speed: recalculate immediately.
+                if abs(new_speed - current_speed) > 0.0001:
+                    break
+
+                chunk = min(0.1, remaining)
+                sleep(chunk)
+                remaining -= chunk
+
+            # OFF or scene deactivation means the worker is finished.
+            if (
+                self.dynamics["status"] != "dynamic_palette"
+                or not self.state.get("on", True)
+            ):
+                self.dynamics["status"] = "none"
+                break
+
             index += 1
             logging.debug("Step forward dynamic scene " + self.name)
         logging.debug("Dynamic Scene " + self.name + " stopped.")

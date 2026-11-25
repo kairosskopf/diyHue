@@ -1,6 +1,6 @@
 import configManager
 import logManager
-from HueObjects import ApiUser, Group, EntertainmentConfiguration, Scene, Rule, ResourceLink, Sensor, Schedule
+from HueObjects import StreamEvent, ApiUser, Group, EntertainmentConfiguration, Scene, Rule, ResourceLink, Sensor, Schedule
 import weakref
 import uuid
 import json
@@ -258,7 +258,7 @@ class ResourceElements(Resource):
                     streamMessage["data"].append(newObject.getV2GroupedLight())
             elif hasattr(newObject, 'getV2Api'):
                 streamMessage["data"].append(newObject.getV2Api())
-            bridgeConfig["temp"]["eventstream"].append(streamMessage)
+            StreamEvent(streamMessage)
             logging.debug(streamMessage)
         logging.info(json.dumps([{"success": {"id": new_object_id}}],
                                 sort_keys=True, indent=4, separators=(',', ': ')))
@@ -449,7 +449,9 @@ class ElementParam(Resource):
         from services.homeAssistantWS import MappingUnavailable
         try:
             if resource == "lights" and param == "state":  # state is applied to a light
-                bridgeConfig[resource][resourceid].setV1State(putDict)
+                if bridgeConfig[resource][resourceid].setV1State(putDict) is False:
+                    return [{"error": {"type": 901, "address": f"/{resource}/{resourceid}/{param}",
+                                       "description": "Light command could not be sent"}}]
             elif param == "action":  # state is applied to a light
                 if "scene" in putDict:
                     bridgeConfig[resource][resourceid].setV1Action(
@@ -472,7 +474,8 @@ class ElementParam(Resource):
             ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
             bridgeConfig["sensors"][resourceid].dxState["lastupdated"] = currentTime
             rulesProcessor(bridgeConfig[resource][resourceid], currentTime)
-        bridgeConfig[resource][resourceid].update_attr({param: putDict})
+        if not (resource == "lights" and param == "state"):
+            bridgeConfig[resource][resourceid].update_attr({param: putDict})
         responseList = []
         responseLocation = "/" + resource + "/" + resourceid + "/" + param + "/"
         for key, value in putDict.items():

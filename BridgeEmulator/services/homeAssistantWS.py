@@ -45,14 +45,19 @@ latest_states = {}
 
 class HomeAssistantClient(WebSocketClient):
 
-    message_id = 1
-    id_to_type = {}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Home Assistant rejects anything but the auth message until it has
         # answered auth_ok, so commands have to wait for this.
         self.authenticated = threading.Event()
+        self.message_id = 1
+        self.id_to_type = {}
+        self.send_lock = threading.RLock()
+        self.snapshot_due = 0
+        self.snapshot_deadline = time.monotonic() + auth_timeout_seconds
+        self.snapshot_id = None
+        self.snapshot_events = {}
 
     def opened(self):
         logging.info("Home Assistant WebSocket Connection Opened")
@@ -61,9 +66,11 @@ class HomeAssistantClient(WebSocketClient):
         logging.info(
             "Home Assistant WebSocket Connection Closed. Code: {} Reason {}".format(code, reason))
         self.authenticated.clear()
-        for home_assistant_state in latest_states.values():
-            if 'state' in home_assistant_state:
-                home_assistant_state['state'] = 'unavailable'
+        with reconfiguration_lock:
+            if self is homeassistant_ws_client and not reflection_enabled():
+                for entity in list(latest_states):
+                    latest_states[entity] = dict(latest_states[entity], state="unavailable")
+                    publish_entity(entity, latest_states[entity])
 
     def received_message(self, m):
         # logging.debug("Received message: {}".format(m))
@@ -99,15 +106,18 @@ class HomeAssistantClient(WebSocketClient):
     def do_auth_complete(self):
         logging.info("Home Assistant Web Socket Authorisation complete")
         self.authenticated.set()
-        self.get_all_lights()
         self.subscribe_for_updates()
+        self.get_all_lights()
 
     def get_all_lights(self):
-        discovery_result.clear()
-        payload = {
-            'type': 'get_states'
-        }
-        self._send_with_id(payload, "getstates")
+        with reconfiguration_lock, self.send_lock:
+            if self.snapshot_id is not None:
+                return
+            discovery_result.clear()
+            self.snapshot_deadline = time.monotonic() + 15
+            self.snapshot_events.clear()
+            self.snapshot_id = self.message_id
+            self._send_with_id({"type": "get_states"}, "getstates")
 
     def subscribe_for_updates(self):
         payload = {
@@ -168,16 +178,55 @@ class HomeAssistantClient(WebSocketClient):
         self._send_with_id(payload, "service")
 
     def do_result(self, message):
-        if 'result' in message and message['result']:
-            message_type = self.id_to_type.pop(message['id'])
-            if message_type == "getstates":
-                latest_states.clear()
-                for ha_state in message['result']:
-                    if self._should_include(ha_state):
-                        entity_id = ha_state.get('entity_id', None)
-                        logging.info(f"Found {entity_id}")
-                        latest_states[entity_id] = ha_state
-                discovery_result.set()
+        with self.send_lock:
+            kind = self.id_to_type.pop(message.get("id"), None)
+        if kind == "service" and not message.get("success"):
+            self.snapshot_due = 0
+        if kind == "subscribe" and not message.get("success"):
+            self.client_terminated = True
+            self.authenticated.clear()
+            self.close_connection()
+        if kind != "getstates":
+            return
+        with reconfiguration_lock:
+            if self is not homeassistant_ws_client or self.client_terminated or reflection_enabled():
+                return
+            self.snapshot_id = None
+            rows = message.get("result")
+            if not message.get("success") or not isinstance(rows, list):
+                self.snapshot_deadline = 0
+                return
+            snapshot = {row["entity_id"]: row for row in rows if self._should_include(row)}
+            # Events received while this read was in flight can be newer
+            # than the returned snapshot. HA timestamps order competing rows.
+            from services.haReflection import revision
+            for entity, event_row in self.snapshot_events.items():
+                if event_row is None:
+                    snapshot.pop(entity, None)
+                    continue
+                candidate = snapshot.get(entity)
+                if candidate is not None:
+                    try:
+                        if revision(candidate) > revision(event_row):
+                            continue
+                    except (AttributeError, KeyError, ValueError, TypeError):
+                        pass
+                snapshot[entity] = event_row
+            self.snapshot_events.clear()
+            import configManager
+            mapped = {light.protocol_cfg.get("entity_id")
+                      for light in list(configManager.bridgeConfig.yaml_config.get("lights", {}).values())
+                      if light.protocol == "homeassistant_ws"}
+            removed = (set(latest_states) | mapped) - snapshot.keys()
+            latest_states.clear()
+            latest_states.update(snapshot)
+            for entity in removed:
+                publish_entity(entity, None)
+            for entity, row in snapshot.items():
+                publish_entity(entity, row)
+            self.snapshot_deadline = float("inf")
+            self.snapshot_due = time.monotonic() + 45
+            discovery_result.set()
 
     def do_event(self, message):
         try:
@@ -188,17 +237,27 @@ class HomeAssistantClient(WebSocketClient):
             logging.exception("No event_type  in event")
 
     def do_state_changed(self, message):
-        try:
-            entity_id = message['event']['data']['entity_id']
-            new_state = message['event']['data']['new_state']
-            if self._should_include(new_state):
-                logging.debug("State update recevied for {}, new state {}".format(
-                    entity_id, new_state))
-                latest_states[entity_id] = new_state
-        except KeyError as e:
-            logging.exception("No state in event: {}", message)
+        data = message.get("event", {}).get("data", {})
+        entity = data.get("entity_id")
+        if not isinstance(entity, str) or not entity.startswith(("light.", "switch.")):
+            return
+        row = data.get("new_state")
+        with reconfiguration_lock:
+            if self is not homeassistant_ws_client or self.client_terminated or reflection_enabled():
+                return
+            included = self._should_include(row)
+            if self.snapshot_id is not None:
+                self.snapshot_events[entity] = row if included else None
+            if included:
+                latest_states[entity] = row
+                publish_entity(entity, row)
+            elif entity in latest_states:
+                del latest_states[entity]
+                publish_entity(entity, None)
 
     def _should_include(self, ha_state):
+        if not isinstance(ha_state, dict) or not isinstance(ha_state.get("entity_id"), str):
+            return False
         should_include = False
         diy_hue_flag = None
         entity_id = ha_state.get('entity_id', None)
@@ -220,10 +279,11 @@ class HomeAssistantClient(WebSocketClient):
         return should_include
 
     def _send_with_id(self, payload, type_of_call):
-        payload['id'] = self.message_id
-        self.id_to_type[self.message_id] = type_of_call
-        self.message_id += 1
-        self._send(payload)
+        with self.send_lock:
+            payload['id'] = self.message_id
+            self.id_to_type[self.message_id] = type_of_call
+            self.message_id += 1
+            self._send(payload)
 
     def _send(self, payload):
         json_payload = json.dumps(payload)
@@ -243,14 +303,60 @@ def assert_command_allowed(light):
         raise MappingUnavailable("HA mapping is not authoritative")
 
 
-def connect_if_required():
-    if event_session is not None:
-        assert event_session.client is not None, "HA session unavailable"
-        return event_session.client
-    if homeassistant_ws_client is None or homeassistant_ws_client.client_terminated:
-        create_websocket_client()
+def update_mapped_light(light, row, bridge):
+    from services.haReflection import translate
+    from services.lightReports import apply_report
+    report = translate(light.state, row) if row else {"reachable": False}
+    apply_report(light, report, bridge.get("groups", {}))
 
-    return homeassistant_ws_client
+
+def publish_entity(entity, row):
+    import configManager
+    bridge = configManager.bridgeConfig.yaml_config
+    for light in list(bridge.get("lights", {}).values()):
+        if light.protocol == "homeassistant_ws" and light.protocol_cfg.get("entity_id") == entity:
+            try:
+                update_mapped_light(light, row, bridge)
+            except (KeyError, TypeError, ValueError, IndexError, ArithmeticError):
+                logging.exception("Invalid Home Assistant state for %s", entity)
+
+
+def maintain_legacy_connection(bridge):
+    while True:
+        time.sleep(5)
+        if not bridge["config"]["homeassistant"].get("enabled"):
+            continue
+        try:
+            with reconfiguration_lock:
+                if reflection_enabled():
+                    continue
+                client = connect_if_required()
+                if client is None:
+                    continue
+                now = time.monotonic()
+                if now >= client.snapshot_deadline:
+                    logging.warning("Home Assistant state read timed out; reconnecting")
+                    client.client_terminated = True
+                    client.authenticated.clear()
+                    client.close_connection()
+                elif client.authenticated.is_set() and client.snapshot_id is None and now >= client.snapshot_due:
+                    client.get_all_lights()
+        except (OSError, ValueError, RuntimeError):
+            logging.exception("Home Assistant connection check failed")
+
+
+def connect_if_required():
+    # A command may already hold the event owner's reducer lock. Reading its
+    # published client here avoids acquiring the lifecycle locks in reverse.
+    owner = event_session
+    if owner is not None:
+        return owner.client
+    with reconfiguration_lock:
+        if event_session is not None:
+            return event_session.client
+        if homeassistant_ws_client is None or homeassistant_ws_client.client_terminated:
+            create_websocket_client()
+        return homeassistant_ws_client
 
 
 def connect_and_authenticate():
@@ -272,13 +378,17 @@ def create_websocket_client():
     try:
         homeassistant_ws_client = HomeAssistantClient(
             homeassistant_url, protocols=['http-only', 'chat'])
+        homeassistant_ws_client.sock.settimeout(auth_timeout_seconds)
         homeassistant_ws_client.connect()
         logging.info("Home Assistant Web Socket Client connected")
-    except:
+        logging_backoff = 2
+    except Exception:
+        if homeassistant_ws_client is not None:
+            homeassistant_ws_client.close_connection()
         if time.time() >= next_connection_error_log:
             logging.exception("Error connecting to Home Assistant WebSocket")
             next_connection_error_log = time.time() + logging_backoff
-            logging_backoff = logging_backoff * 2
+            logging_backoff = min(300, logging_backoff * 2)
         homeassistant_ws_client = None
 
 
@@ -359,7 +469,8 @@ def discover(detectedLights):
     logging.info("HomeAssistant WebSocket discovery devices received, timeout? {}".format(
         (not completed)))
     # This only loops over discovered devices so we have already filtered out what we don't want
-    states = latest_states
+    with reconfiguration_lock:
+        states = dict(latest_states)
     if event_session is not None:
         with event_session.reducer.lock:
             states = dict(event_session.reducer.rows)

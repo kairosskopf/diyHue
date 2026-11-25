@@ -47,7 +47,8 @@ def translate(existing, row):
 
 
 class Reflector:
-    def __init__(self, lights, included, max_pending=4096):
+    def __init__(self, lights, included, max_pending=4096, apply_state=None):
+        self.apply_state = apply_state or (lambda light, state: light.state.update(state))
         self.lights = lights
         self.included = included
         self.max_pending = max_pending
@@ -80,7 +81,7 @@ class Reflector:
                 self.needs_sync = True
                 for light in list(self.lights.values()):
                     if light.protocol == 'homeassistant_ws':
-                        light.state['reachable'] = False
+                        self.apply_state(light, {"reachable": False})
 
     def begin_snapshot(self, epoch):
         with self.lock:
@@ -126,9 +127,9 @@ class Reflector:
         for light in list(self.lights.values()):
             if light.protocol == 'homeassistant_ws' and light.protocol_cfg.get('entity_id') == entity:
                 if entity in self.tombstones:
-                    light.state['reachable'] = False
+                    self.apply_state(light, {"reachable": False})
                 else:
-                    light.state.update(translate(light.state, row))
+                    self.apply_state(light, translate(light.state, row))
 
     def event(self, epoch, entity, row):
         with self.lock:

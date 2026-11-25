@@ -1,7 +1,7 @@
 import logManager
 import configManager
 from lights.protocols import protocols
-from contextlib import nullcontext
+from services.lightReports import apply_report
 from time import sleep
 from datetime import datetime, timedelta, timezone
 
@@ -11,40 +11,33 @@ bridgeConfig = configManager.bridgeConfig.yaml_config
 def syncWithLights(off_if_unreachable): #update Hue Bridge lights states
     while True:
         logging.info("start lights sync")
-        for key, light in bridgeConfig["lights"].items():
-            protocol_name = light.protocol
-            if protocol_name == "homeassistant_ws":
-                from services.homeAssistantWS import reflection_enabled
-                if reflection_enabled():
-                    continue
+        for key, light in list(bridgeConfig["lights"].items()):
+            name = light.protocol
+            # Both HA clients apply state reports directly from their WebSocket.
+            if name in ("mqtt", "flex", "mi_box", "dummy", "homeassistant_ws"):
+                continue
             for protocol in protocols:
-                if "lights.protocols." + protocol_name == protocol.__name__ and protocol_name not in ["mqtt", "flex", "mi_box", "dummy"]:
+                if protocol.__name__ != "lights.protocols." + name:
+                    continue
+                try:
+                    report = dict(protocol.get_light_state(light))
+                    report.setdefault("reachable", True)
+                except Exception as error:
+                    logging.warning("%s is unreachable: %s", light.name, error)
+                    report = {"reachable": False}
+                    if off_if_unreachable:
+                        report["on"] = False
+                if bridgeConfig["lights"].get(key) is light:
                     try:
-                        logging.debug("fetch " + light.name)
-                        newState = protocol.get_light_state(light)
-                        logging.debug(newState)
-                        from services import homeAssistantWS
-                        lock = homeAssistantWS.reconfiguration_lock if protocol_name == 'homeassistant_ws' else nullcontext()
-                        with lock:
-                            if protocol_name == 'homeassistant_ws' and homeAssistantWS.reflection_enabled():
-                                continue
-                            light.state.update(newState)
-                            light.state["reachable"] = True
-                    except Exception as e:
-                        from services import homeAssistantWS
-                        lock = homeAssistantWS.reconfiguration_lock if protocol_name == 'homeassistant_ws' else nullcontext()
-                        with lock:
-                            if protocol_name == 'homeassistant_ws' and homeAssistantWS.reflection_enabled():
-                                continue
-                            light.state["reachable"] = False
-                            if off_if_unreachable:
-                                light.state["on"] = False
-                        logging.warning(light.name + " is unreachable: %s", e)
+                        apply_report(light, report, bridgeConfig["groups"])
+                    except (TypeError, ValueError, KeyError, IndexError):
+                        logging.exception("Invalid state for %s", light.name)
+                break
 
         sleep(10) #wait at last 10 seconds before next sync
         i = 0
         while i < 300: #sync with lights every 300 seconds or instant if one user is connected
-            for key, user in bridgeConfig["apiUsers"].items():
+            for key, user in list(bridgeConfig["apiUsers"].items()):
                 lu = user.last_use_date
                 try: #in case if last use is not a proper datetime
                     lu = datetime.strptime(lu, "%Y-%m-%dT%H:%M:%S")
@@ -52,7 +45,6 @@ def syncWithLights(off_if_unreachable): #update Hue Bridge lights states
                         i = 300
                         break
                 except Exception as e:
-                    logging.warning(user.last_use_date + " is not: %s", e)
-                    logging.warning(e)
+                    logging.debug("Invalid last-use date %r: %s", lu, e)
             i += 1
             sleep(1)

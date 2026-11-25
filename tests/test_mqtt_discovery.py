@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "BridgeEmulator"))
 
@@ -29,6 +29,9 @@ def device(model_id, friendly_name, ieee_address):
 
 class MqttDiscoveryTests(unittest.TestCase):
     def setUp(self):
+        patcher = patch.object(mqtt, "bridgeConfig", CONFIG)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         CONFIG.clear()
         CONFIG.update({"config": {"mqtt": {"enabled": True}}, "sensors": {}, "lights": {}, "groups": {}})
         self.sensors = CONFIG["sensors"]

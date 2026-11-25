@@ -58,7 +58,9 @@ class EventSession:
     def __init__(self, bridge, client_class, include):
         self.bridge = bridge
         self.client_class = client_class
-        self.reducer = Reflector(bridge['lights'], include)
+        from services.lightReports import apply_report
+        self.reducer = Reflector(bridge['lights'], include,
+                                 apply_state=lambda light, state: apply_report(light, state, bridge.get("groups", {})))
         self.stop = threading.Event()
         self.lifecycle_lock = threading.RLock()
         self.client = None

@@ -12,6 +12,7 @@ class FakeLight:
     def __init__(self, id_v1, modelid, on=True):
         self.id_v1 = id_v1
         self.modelid = modelid
+        self.config = {}
         self.protocol = "native"
         self.protocol_cfg = {"ip": "127.0.0.1"}
         self.state = {"on": on, "bri": 100}

@@ -7,10 +7,17 @@ from HueObjects import genV2Uuid, StreamEvent
 
 logging = logManager.logger.get_logger(__name__)
 
-def remove_scene(scenes, key):
+def _scene_event(kind, resource, *, deleted_by=None):
+    StreamEvent({"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "id": genV2Uuid(), "type": kind, "data": [resource]}, deleted_by=deleted_by)
+
+
+def remove_scene(scenes, key, resource_type="scene", *, deleted_by=None):
     """Remove the registered resource before notifying open Hue clients."""
     scene = scenes.pop(key)
-    scene.publish_event("delete")
+    collection = "scenes" if resource_type == "scene" else "smart_scene"
+    resource = {"id": scene.id_v2, "id_v1": f"/{collection}/{key}", "type": resource_type}
+    _scene_event("delete", resource, deleted_by=deleted_by)
 
 
 class Scene():
@@ -41,10 +48,7 @@ class Scene():
                 self.storelightstate()
 
     def publish_event(self, kind):
-        resource = ({"id": self.id_v2, "id_v1": "/scenes/" + self.id_v1, "type": "scene"}
-                    if kind == "delete" else self.getV2Api())
-        StreamEvent({"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                     "id": genV2Uuid(), "type": kind, "data": [resource]})
+        _scene_event(kind, self.getV2Api())
 
     def add_light(self, light):
         self.lights.append(light)

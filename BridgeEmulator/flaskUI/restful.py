@@ -434,7 +434,7 @@ class Element(Resource):
                     Scene.remove_scene(bridgeConfig["scenes"], key)
             configManager.bridgeConfig.mark_dirty("scenes")
         if resource == "scenes":
-            Scene.remove_scene(bridgeConfig["scenes"], resourceid)
+            Scene.remove_scene(bridgeConfig["scenes"], resourceid, deleted_by=bridgeConfig["apiUsers"].get(username))
         else:
             del bridgeConfig[resource][resourceid]
         if resource in ["groups", "lights"]:

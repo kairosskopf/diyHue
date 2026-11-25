@@ -129,7 +129,9 @@ def runScheduler():
             except Exception as e:
                 logging.info("Exception while processing the behavior_instance " + obj.name + " | " + str(e))
 
-        for smartscene, obj in bridgeConfig["smart_scene"].items():
+        for smartscene, obj in list(bridgeConfig["smart_scene"].items()):
+            if bridgeConfig["smart_scene"].get(smartscene) is not obj:
+                continue
             try:
                 if hasattr(obj, "timeslots"):
                     sunset_slot = -1

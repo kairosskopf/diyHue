@@ -116,14 +116,16 @@ class HueStateUpdates(unittest.TestCase):
                     messages = []
                     for _ in range(count):
                         seq, data = next(stream).decode().strip().splitlines()
-                        messages.append((int(seq[4:]), json.loads(data[6:])[0]["data"][0]["id"]))
+                        messages.append((seq[4:], json.loads(data[6:])[0]["data"][0]["id"]))
                     return messages
                 finally:
                     response.close()
-        expected = [(cursor + 1, "first"), (cursor + 2, "second")]
+        expected = read(cursor, 2)
+        self.assertEqual([value for _, value in expected], ["first", "second"])
+        self.assertRegex(expected[0][0], r"^[0-9]+:[0-9]+$")
+        self.assertNotEqual(expected[0][0], expected[1][0])
         self.assertEqual(read(cursor, 2), expected)
-        self.assertEqual(read(cursor, 2), expected)
-        self.assertEqual(read(cursor + 1, 1), expected[1:])
+        self.assertEqual(read(expected[0][0], 1), expected[1:])
 
     def test_light_added_during_poll_does_not_kill_worker(self):
         self.first.protocol = "native"

@@ -15,7 +15,7 @@ if not isinstance(sys.modules.get("configManager"), SimpleNamespace):
 import logManager
 logManager.logger.configure_logger("CRITICAL")
 from flaskUI import restful, v2restapi
-from HueObjects import event_sequence, events_after
+from HueObjects import event_sequence, events_after, stream_events_after, StreamEvent
 from HueObjects.Group import Group
 from HueObjects.Light import Light
 from services import eventStreamer
@@ -31,6 +31,8 @@ class SceneEvents(unittest.TestCase):
         config = {"apiUsers": {"key": SimpleNamespace(username="key")}, "scenes": {}, "smart_scene": {},
                   "lights": {l.id_v1: l for l in self.lights}, "groups": {"1": self.room}, "sensors": {}}
         store = SimpleNamespace(bridgeConfig=SimpleNamespace(yaml_config=config, mark_dirty=Mock(), save_config=Mock()))
+        self.users = config["apiUsers"]
+        self.smart_scenes = config["smart_scene"]
         self.scenes = config["scenes"]
         self.save_config = store.bridgeConfig.save_config
         for module in (restful, v2restapi):
@@ -57,12 +59,12 @@ class SceneEvents(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return self.path + "/" + response.json["data"][0]["rid"]
 
-    def subscribe(self):
+    def subscribe(self, headers=None):
         # Keep the real Flask stream open across writes. A missing event returns
         # a keepalive immediately so regressions fail without hanging the tests.
-        self.enterContext(patch.object(eventStreamer, "events_after",
-                                      side_effect=lambda cursor: events_after(cursor, timeout=0)))
-        response = self.client.get("/eventstream/clip/v2", buffered=False)
+        self.enterContext(patch.object(eventStreamer, "stream_events_after",
+                                      side_effect=lambda cursor: stream_events_after(cursor, timeout=0)))
+        response = self.client.get("/eventstream/clip/v2", headers=headers, buffered=False)
         self.addCleanup(response.close)
         frames = iter(response.response)
         self.assertIn(b": hi", next(frames))
@@ -93,6 +95,66 @@ class SceneEvents(unittest.TestCase):
         gc.collect()
         self.assertFalse(any(e["type"] == "delete" and r["type"] == "scene"
                              for _, e in events_after(cursor, 0) for r in e["data"]))
+
+    def test_reconnect_after_delete_without_checkpoint_recovers_own_scene(self):
+        path = self.create()
+        rid = path.rsplit("/", 1)[1]
+        self.assertEqual(self.client.delete(path).status_code, 200)
+        StreamEvent({"type": "update", "data": [{"id": "other", "type": "button"}]})
+        for headers in (None, {"Last-Event-ID": "1:9999"}):
+            frames = self.subscribe(headers)
+            self.assertEqual(self.next_event(frames, "delete")["id"], rid)
+            self.assertIn(b": keepalive", next(frames))
+        self.users["other-key"] = SimpleNamespace(username="other-key")
+        other = self.subscribe({"hue-application-key": "other-key"})
+        self.assertIn(b": keepalive", next(other))
+        StreamEvent({"type": "add", "data": [{"id": rid, "type": "scene"}]})
+        restored = self.subscribe()
+        self.assertIn(b": keepalive", next(restored))
+
+    def test_expired_deletion_is_not_replayed_on_a_fresh_subscription(self):
+        path = self.create()
+        with patch("HueObjects.monotonic", return_value=100):
+            self.client.delete(path)
+        with patch("HueObjects.monotonic", return_value=401):
+            self.assertIn(b": keepalive", next(self.subscribe()))
+
+    def test_resume_after_delete_with_its_wire_id_skips_already_seen_deletion(self):
+        path = self.create()
+        frames = self.subscribe()
+        self.client.delete(path)
+        wire_line, data_line = next(frames).decode().strip().splitlines()
+        self.assertEqual(json.loads(data_line[6:])[0]["type"], "delete")
+        resumed = self.subscribe({"Last-Event-ID": wire_line.removeprefix("id: ")})
+        self.assertIn(b": keepalive", next(resumed))
+
+    def test_smart_scene_delete_uses_its_storage_key_and_notifies_once(self):
+        # Both resources have v1 id 1, with independent public v2 IDs.
+        regular = self.create()
+        path = "/clip/v2/resource/smart_scene"
+        created = self.client.post(path, json={"metadata": {"name": "Natural light"},
+            "group": self.payload["group"], "recall": {"action": "deactivate"},
+            "week_timeslots": [{"timeslots": [], "recurrence": ["monday"]}]})
+        self.assertEqual(created.status_code, 200)
+        rid = created.json["data"][0]["rid"]
+        single = path + "/" + rid
+        held = self.smart_scenes["1"]
+        self.assertEqual(self.client.get(single).json["data"][0]["id"], rid)
+        frames = self.subscribe()
+        removed = self.client.delete(single)
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(removed.json, {"errors": [], "data": [{"rid": rid, "rtype": "smart_scene"}]})
+        self.assertEqual(self.next_event(frames, "delete"),
+                         {"id": rid, "id_v1": "/smart_scene/1", "type": "smart_scene"})
+        self.save_config.assert_called_with(backup=False, resource="smart_scene", blocking=True)
+        self.assertEqual(self.client.get(path).json["data"], [])
+        self.assertEqual(self.client.get(single).json["data"], [])
+        self.assertEqual(self.client.get(regular).json["data"][0]["type"], "scene")
+        cursor = event_sequence()
+        self.assertEqual(self.client.delete(single).status_code, 404)
+        del held
+        gc.collect()
+        self.assertFalse(any(r.get("id") == rid for _, event in events_after(cursor, 0) for r in event["data"]))
 
     def test_create_streams_only_requested_actions_and_matches_get(self):
         frames = self.subscribe()

@@ -34,16 +34,6 @@ class SmartScene():
         streamMessage["data"][0].update(self.getV2Api())
         StreamEvent(streamMessage)
 
-    def __del__(self):
-        streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         "data": [{"id": self.id_v2, "type": "smart_scene"}],
-                         "id": str(uuid.uuid4()),
-                         "type": "delete"
-                         }
-        streamMessage["id_v1"] = "/smart_scene/" + self.id_v1
-        StreamEvent(streamMessage)
-        logging.info(self.name + " smart_scene was destroyed.")
-
     def _set_state(self, state):
         if self.state == state:
             return

@@ -5,19 +5,32 @@ from collections import deque
 from copy import deepcopy
 from itertools import islice
 from threading import Condition
+from time import monotonic, time
 
 logging = logManager.logger.get_logger(__name__)
 
 eventstream = deque(maxlen=2000)
 _event_condition = Condition()
 _event_sequence = 0
+_event_headers = {}
+_event_second = 0
+_index_in_second = 0
+_SCENE_REPLAY_SECONDS = 300
 
 
-def StreamEvent(message):
-    global _event_sequence
+def StreamEvent(message, *, deleted_by=None):
+    global _event_sequence, _event_second, _index_in_second
     with _event_condition:
         eventstream.append(deepcopy(message))
         _event_sequence += 1
+        # Hue event IDs use Unix seconds and an index within that second.
+        # Keep IDs increasing if the wall clock is corrected backwards.
+        second = max(int(time()), _event_second)
+        _index_in_second = _index_in_second + 1 if second == _event_second else 0
+        _event_second = second
+        expires = monotonic() + _SCENE_REPLAY_SECONDS if deleted_by is not None else 0
+        _event_headers[_event_sequence] = (f"{second}:{_index_in_second}", deleted_by, expires)
+        _event_headers.pop(_event_sequence - eventstream.maxlen, None)
         _event_condition.notify_all()
 
 
@@ -32,6 +45,45 @@ def events_after(cursor, timeout=15):
         first = _event_sequence - len(eventstream) + 1
         index = max(0, cursor + 1 - first)
         return list(enumerate(islice(eventstream, index, None), start=first + index))
+
+
+def stream_events_after(cursor, timeout=15):
+    with _event_condition:
+        return [(seq, _event_headers[seq][0], message)
+                for seq, message in events_after(cursor, timeout)]
+
+
+def stream_start(last_id, user):
+    """Take the replay snapshot and the live cursor under the publisher's lock."""
+    with _event_condition:
+        current = _event_sequence
+        first = current - len(eventstream) + 1
+        if last_id:
+            # Accept numeric IDs sent by previous diyHue builds as well.
+            if last_id.isascii() and last_id.isdecimal() and len(last_id) < 20:
+                seq = int(last_id)
+                if first - 1 <= seq <= current:
+                    return seq, [], "resume"
+            for seq in range(current, first - 1, -1):
+                if _event_headers[seq][0] == last_id:
+                    return seq, [], "resume"
+
+        # Without a checkpoint we cannot safely repeat button presses or older
+        # light states. Re-send only this app's recent scene deletions. A later
+        # add for the same UUID cancels the deletion, including after a restore.
+        pending = {}
+        now = monotonic()
+        for seq, message in enumerate(eventstream, first):
+            wire_id, deleted_by, expires = _event_headers[seq]
+            if deleted_by is user and user is not None and expires > now:
+                resource = message["data"][0]
+                pending[resource["id"]] = (seq, wire_id, message)
+            elif pending:
+                for event in message if isinstance(message, list) else (message,):
+                    if event.get("type") == "add":
+                        for resource in event.get("data", []):
+                            pending.pop(resource.get("id"), None)
+        return current, list(pending.values()), "unknown checkpoint" if last_id else "no checkpoint"
 
 
 def v1StateToV2(v1State):

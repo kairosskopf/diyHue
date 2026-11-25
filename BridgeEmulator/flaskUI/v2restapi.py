@@ -29,23 +29,24 @@ v2Resources = {"light": {}, "scene": {}, "smart_scene": {}, "grouped_light": {},
 def stopSmartScenesOn(group):
     """A scene recalled on a group replaces any smart scene running on it."""
     from functions.scripts import findGroup
-    for smart_scene in bridgeConfig["smart_scene"].values():
+    for smart_scene in list(bridgeConfig["smart_scene"].values()):
         if smart_scene.state == "active" and smart_scene.group and findGroup(smart_scene.group["rid"]) is group:
             smart_scene.stop()
             configManager.bridgeConfig.mark_dirty("smart_scene")
 
 
 def getObject(element, v2uuid):
-    if element == "scene":
+    if element in ("scene", "smart_scene"):
+        collection = "scenes" if element == "scene" else "smart_scene"
         # A reader can hold a removed Scene alive. The registry is authoritative.
-        return next((scene for scene in list(bridgeConfig["scenes"].values())
+        return next((scene for scene in list(bridgeConfig[collection].values())
                      if scene.id_v2 == v2uuid), None)
     if element in ["behavior_instance"]:
         return bridgeConfig[element][v2uuid]
     elif element in v2Resources and v2uuid in v2Resources[element]:
         logging.debug("Cache Hit for " + element)
         return v2Resources[element][v2uuid]()
-    elif element in ["light", "grouped_light", "smart_scene"]:
+    elif element in ["light", "grouped_light"]:
         for v1Element in ["lights", "groups", "scenes", "smart_scene"]:
             for key, obj in bridgeConfig[v1Element].items():
                 if obj.id_v2 == v2uuid:
@@ -744,6 +745,8 @@ class ClipV2ResourceId(Resource):
             if edited or "recall" in putDict:
                 object.publish_event("update")
         elif resource == "smart_scene":
+            if not object:
+                return {"data": [], "errors": [{"description": "Scene not found"}]}, 404
             if "recall" in putDict and "action" in putDict["recall"]:
                 object.activate(putDict)
             if "transition_duration" in putDict:
@@ -876,12 +879,13 @@ class ClipV2ResourceId(Resource):
             return "", 403
         object = getObject(resource, resourceid)
 
-        if resource == "scene":
+        if resource in ("scene", "smart_scene"):
             if not object:
                 return {"data": [], "errors": [{"description": "Scene not found"}]}, 404
-            Scene.remove_scene(bridgeConfig["scenes"], object.id_v1)
-            configManager.bridgeConfig.mark_dirty("scenes")
-            configManager.bridgeConfig.save_config(backup=False, resource="scenes", blocking=True)
+            collection = "scenes" if resource == "scene" else "smart_scene"
+            Scene.remove_scene(bridgeConfig[collection], object.id_v1, resource, deleted_by=authorisation["user"])
+            configManager.bridgeConfig.mark_dirty(collection)
+            configManager.bridgeConfig.save_config(backup=False, resource=collection, blocking=True)
         elif hasattr(object, 'getObjectPath'):
             # getObjectPath returns V1 resource names (e.g. "lights", "groups")
             # which map directly to CONFIG_FILES keys

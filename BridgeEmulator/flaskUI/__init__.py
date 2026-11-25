@@ -13,7 +13,7 @@ def serialize_scene_writes(handler):
     @wraps(handler)
     def dispatch(*args, **kwargs):
         resource = kwargs["resource"] if "resource" in kwargs else args[resource_index]
-        if resource in ("scene", "scenes"):
+        if resource in ("scene", "scenes", "smart_scene"):
             with _scene_write_lock:
                 return handler(*args, **kwargs)
         return handler(*args, **kwargs)

@@ -130,7 +130,7 @@ class Group():
                          }
         StreamEvent(streamMessage)
 
-    def update_state(self):
+    def update_state(self, *, exact_brightness=False):
         all_on = True
         any_on = False
         bri = 0
@@ -148,7 +148,7 @@ class Group():
                     all_on = False
         if any_on:
             bri = (((bri/lights_on)/254)*100) if bri > 0 else 0
-        return {"all_on": all_on, "any_on": any_on, "avr_bri": int(bri)}
+        return {"all_on": all_on, "any_on": any_on, "avr_bri": round(bri, 2) if exact_brightness else int(bri)}
 
     def setV2Action(self, state):
         v1State = v2StateToV1(state)
@@ -160,19 +160,22 @@ class Group():
         v2State = v1StateToV2(state)
         self.genStreamEvent(v2State)
 
+    def grouped_light_owner(self):
+        if self.id_v1 == "0":
+            kind = "bridge_home"
+        else:
+            kind = "room" if self.type == "Room" else "zone"
+        return {"rid": str(uuid.uuid5(uuid.NAMESPACE_URL, self.id_v2 + kind)), "rtype": kind}
+
     def genStreamEvent(self, v2State):
         v2State = dict(v2State)
         if "on" in v2State or "dimming" in v2State:
-            summary = self.update_state()
+            summary = self.update_state(exact_brightness=True)
             v2State["on"] = {"on": summary["any_on"]}
             v2State["dimming"] = {"brightness": summary["avr_bri"]}
         streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                          "data": [{"id": self.id_v2,"id_v1": "/groups/" + self.id_v1, "type": "grouped_light",
-                                   "owner": {
-                                       "rid": self.getV2Room()["id"] if self.type == "Room" else self.getV2Zone()["id"],
-                                       "rtype": "room" if self.type == "Room" else "zone"
-                                   }
-                                   }],
+                                   "owner": self.grouped_light_owner()}],
                          "id": str(uuid.uuid4()),
                          "type": "update"
                          }
@@ -296,17 +299,15 @@ class Group():
             ]
         }
         result["color"] = {}
-        result["dimming"] = {"brightness": self.update_state()["avr_bri"]}
+        summary = self.update_state(exact_brightness=True)
+        result["dimming"] = {"brightness": summary["avr_bri"]}
         result["dimming_delta"] = {}
         result["dynamics"] = {}
         result["id"] = self.id_v2
         result["id_v1"] = "/groups/" + self.id_v1
-        result["on"] = {"on": self.update_state()["any_on"]}
+        result["on"] = {"on": summary["any_on"]}
         result["type"] = "grouped_light"
-        if hasattr(self, "owner"):
-            result["owner"] = {"rid": self.owner.username, "rtype": "device"}
-        else:
-            result["owner"] = {"rid": self.id_v2, "rtype": "device"}
+        result["owner"] = self.grouped_light_owner()
         result["signaling"] = {"signal_values": [
             "no_signal",
             "on_off"]}

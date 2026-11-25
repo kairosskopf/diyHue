@@ -17,11 +17,7 @@ def apply_report(light, report, groups):
     after = light.getV2Api()
     changes = {key: value for key, value in after.items() if before.get(key) != value}
     if changes:
-        light.genStreamEvent(changes)
-        if "on" in changes or "dimming" in changes:
-            for group in list(groups.values()):
-                if group.type in ("Room", "Zone") and any(ref() is light for ref in group.lights):
-                    group.genStreamEvent({key: changes[key] for key in ("on", "dimming") if key in changes})
+        light.genStreamEvent(changes, groups=groups)
     if light.state.get("reachable") != reachable:
         StreamEvent({"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                      "id": str(uuid4()), "type": "update", "data": [light.getZigBee()]})

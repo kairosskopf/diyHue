@@ -3,7 +3,7 @@ import logManager
 import weakref
 from threading import Thread
 from datetime import datetime, timezone
-from HueObjects import genV2Uuid, StreamEvent
+from HueObjects import genV2Uuid, StreamEvent, set_light_actions
 
 logging = logManager.logger.get_logger(__name__)
 
@@ -92,16 +92,14 @@ class Scene():
                 self.status = "inactive"
                 return
 
-        queueState = {}
+        actions = []
         # "recall" is only present when the scene is triggered via the v2 REST API
         # (PUT /clip/v2/resource/scene with a recall action).  Internal callers such
         # as behavior_instance automation pass a plain transition dict instead, so we
         # fall back to "active" when the key is absent.
         self.status = data["recall"]["action"] if "recall" in data else "active"
-        for light, state in self.lightstates.items():
-            logging.debug(state)
-            light.state.update(state)
-            light.updateLightState(state)
+        for light, saved_state in self.lightstates.items():
+            state = saved_state.copy()
             if light.dynamics["status"] == "dynamic_palette":
                 light.dynamics["status"] = "none"
                 logging.debug("Stop Dynamic scene play for " + light.name)
@@ -117,24 +115,11 @@ class Scene():
                     state["transitiontime"] = int(
                         data["recall"]["duration"] / 100)
 
-            if light.protocol in ["native_multi", "mqtt"]:
-                if light.protocol_cfg["ip"] not in queueState:
-                    queueState[light.protocol_cfg["ip"]] = {
-                        "object": light, "lights": {}}
-                if light.protocol == "native_multi":
-                    queueState[light.protocol_cfg["ip"]
-                               ]["lights"][light.protocol_cfg["light_nr"]] = state
-                elif light.protocol == "mqtt":
-                    queueState[light.protocol_cfg["ip"]
-                               ]["lights"][light.protocol_cfg["command_topic"]] = state
-            else:
-                logging.debug(state)
-                light.setV1State(state)
-        for device, state in queueState.items():
-            state["object"].setV1State(state)
+            actions.append((light, state))
+        set_light_actions(actions)
 
         if self.type == "GroupScene":
-            self.group().state["any_on"] = True
+            self.group().state = self.group().update_state()
 
     def getV1Api(self):
         result = {}

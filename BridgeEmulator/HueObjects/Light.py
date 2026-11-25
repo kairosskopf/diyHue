@@ -2,7 +2,7 @@ import uuid
 import logManager
 from lights.light_types import lightTypes, archetype
 from lights.protocols import protocols, wled
-from HueObjects import genV2Uuid, incProcess, v1StateToV2, generate_unique_id, v2StateToV1, StreamEvent
+from HueObjects import genV2Uuid, incProcess, v1StateToV2, generate_unique_id, v2StateToV1, StreamEvent, limit_brightness, publish_group_brightness
 from datetime import datetime, timezone
 from copy import deepcopy
 from time import sleep
@@ -157,23 +157,19 @@ class Light():
         elif ("hue" in state or "sat" in state) and "hue" in self.state:
             self.state["colormode"] = "hs"
 
-    def setV1State(self, state, advertise=True):
+    def setV1State(self, state, advertise=True, *, group_changes=None):
         if self.protocol == "homeassistant_ws":
             from services import homeAssistantWS
             if homeAssistantWS.event_session is not None:
                 with homeAssistantWS.event_session.reducer.lock:
                     homeAssistantWS.assert_command_allowed(self)
-                    return self._setV1State(state, advertise)
-        return self._setV1State(state, advertise)
+                    return self._setV1State(state, advertise, group_changes)
+        return self._setV1State(state, advertise, group_changes)
 
-    def _setV1State(self, state, advertise=True):
+    def _setV1State(self, state, advertise, group_changes):
         if "lights" not in state:
             state = incProcess(self.state.copy(), state)
-            if "bri" in state:
-                if "min_bri" in self.protocol_cfg:
-                    state["bri"] = max(state["bri"], self.protocol_cfg["min_bri"])
-                if "max_bri" in self.protocol_cfg:
-                    state["bri"] = min(state["bri"], self.protocol_cfg["max_bri"])
+            limit_brightness(state, self.protocol_cfg)
             if self.protocol == "homeassistant_ws":
                 from lights.protocols import homeassistant_ws
                 from services.homeAssistantWS import MappingUnavailable
@@ -214,7 +210,9 @@ class Light():
                     break
         if advertise and "lights" not in state:
             v2State = v1StateToV2(state)
-            self.genStreamEvent(v2State)
+            self.genStreamEvent(v2State, groups=None if group_changes is None else {})
+            if group_changes is not None and ("on" in state or "bri" in state):
+                group_changes.add(self)
 
     def setV2State(self, state):
         v1State = v2StateToV1(state)
@@ -237,7 +235,18 @@ class Light():
             return False
         self.genStreamEvent(state)
 
-    def genStreamEvent(self, v2State):
+    def genStreamEvent(self, v2State, groups=None):
+        # Commands may be quantized, limited per lamp, or corrected by a device
+        # report. Publish the same brightness and power that a subsequent GET sees.
+        if "on" in v2State or "dimming" in v2State:
+            current = self.getV2Api()
+            v2State = v2State.copy()
+            for key in ("on", "dimming"):
+                if key in v2State:
+                    if key in current:
+                        v2State[key] = current[key]
+                    else:
+                        del v2State[key]
         streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                          "data": [{"id": self.id_v2,"id_v1": "/lights/" + self.id_v1, "type": "light"}],
                          "id": str(uuid.uuid4()),
@@ -253,6 +262,8 @@ class Light():
                          "type": "update"
                          }
         StreamEvent(streamMessage)
+        if "on" in v2State or "dimming" in v2State:
+            publish_group_brightness({self}, groups)
 
     def getDevice(self):
         result = {"id": str(uuid.uuid5(

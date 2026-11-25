@@ -49,7 +49,11 @@ def set_light(light, data):
             if key == "childlock":
                 payload["child_lock"] = "LOCK" if value else "UNLOCK"
         if colorFromHsv:
-            color = hsv_to_rgb(data['hue'], data['sat'], light.state["bri"])
+            state = lightsData[topic]
+            current = data.get("members", {}).get(topic, light).state
+            color = hsv_to_rgb(state.get("hue", current.get("hue", 0)),
+                               state.get("sat", current.get("sat", 0)),
+                               state.get("bri", current.get("bri", 254)))
             payload['color'] = { 'r': color[0], 'g': color[1], 'b': color[2] }
         messages.append({"topic": topic, "payload": json.dumps(payload)})
     logging.debug("MQTT publish to: " + json.dumps(messages))

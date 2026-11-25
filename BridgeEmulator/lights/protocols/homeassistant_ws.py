@@ -1,4 +1,5 @@
 import logManager
+from services.haReflection import hue_brightness
 from services.homeAssistantWS import connect_and_authenticate, connect_if_required, latest_states
 from pprint import pprint
 logging = logManager.logger.get_logger(__name__)
@@ -61,8 +62,8 @@ def translate_homeassistant_state_to_diyhue_state(existing_diy_hue_state, ha_sta
     diyhue_state["on"] = is_on
     if "attributes" in ha_state and is_on:  # Home assistant only reports attributes if light is on
         for key, value in ha_state['attributes'].items():
-            if key == "brightness":
-                diyhue_state['bri'] = value
+            if key == "brightness" and isinstance(value, (int, float)):
+                diyhue_state['bri'] = hue_brightness(value)
             if key == "color_temp":
                 diyhue_state['ct'] = value
                 diyhue_state['colormode'] = 'ct'

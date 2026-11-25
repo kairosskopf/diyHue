@@ -2,6 +2,7 @@ import logManager
 import json
 import time
 import threading
+from services.haReflection import ha_brightness
 from ws4py.client.threadedclient import WebSocketClient
 
 logging = logManager.logger.get_logger(__name__)
@@ -151,7 +152,7 @@ class HomeAssistantClient(WebSocketClient):
             if key == "ct":
                 service_data['color_temp_kelvin'] = 1000000 / value
             if key == "bri":
-                service_data['brightness'] = value
+                service_data['brightness'] = ha_brightness(value)
             if key == "xy":
                 service_data['xy_color'] = [value[0], value[1]]
             if key == "hue":

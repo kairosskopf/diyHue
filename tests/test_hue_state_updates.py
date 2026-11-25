@@ -10,10 +10,12 @@ from flask import Flask
 sys.modules.setdefault("configManager", SimpleNamespace(bridgeConfig=SimpleNamespace(yaml_config={})))
 import configManager
 from flaskUI import v2restapi
-from HueObjects import StreamEvent, event_sequence, events_after
+from functions.colors import hsv_to_rgb
+from HueObjects import StreamEvent, event_sequence, events_after, stream_events_after
 from HueObjects.EntertainmentConfiguration import EntertainmentConfiguration
 from HueObjects.Group import Group
 from HueObjects.Light import Light
+from HueObjects.Scene import Scene
 from services import eventStreamer, homeAssistantWS as ha, stateFetch
 from services.lightReports import apply_report
 
@@ -66,6 +68,125 @@ class HueStateUpdates(unittest.TestCase):
         self.change("on", 5)
         self.assertEqual(events_after(cursor, 0), [])
 
+    def brightness_events(self, cursor):
+        return {resource["id"]: resource["dimming"]["brightness"]
+                for _, event in events_after(cursor, 0) for resource in event["data"]
+                if "dimming" in resource}
+
+    def test_individual_brightness_command_updates_room_even_with_identical_echo(self):
+        self.second.state["on"] = True
+        self.second.protocol_cfg["max_bri"] = 127
+        cursor = event_sequence()
+        self.second.setV2State({"dimming": {"brightness": 90}})
+        apply_report(self.second, {"bri": 127}, self.bridge["groups"])
+        self.assertEqual(self.brightness_events(cursor),
+                         {self.second.id_v2: 50, self.room.id_v2: 50})
+
+    def test_group_brightness_limit_is_per_lamp(self):
+        self.first.protocol_cfg["max_bri"] = 127
+        cursor = event_sequence()
+        with patch("lights.protocols.homeassistant_ws.set_light"):
+            self.room.setV2Action({"on": {"on": True}, "dimming": {"brightness": 100}})
+        self.assertEqual([self.first.state["bri"], self.second.state["bri"]], [127, 254])
+        self.assertEqual(self.brightness_events(cursor),
+                         {self.first.id_v2: 50, self.second.id_v2: 100, self.room.id_v2: 75})
+
+    def test_mqtt_scene_recall_publishes_brightness_before_device_echo(self):
+        self.second.protocol = "mqtt"
+        self.second.protocol_cfg.update(ip="broker", command_topic="z2m/lamp/set")
+        scene = Scene({"id_v1": "4", "name": "Reading", "owner": None})
+        scene.lightstates[self.second] = {"on": True, "bri": 127}
+        cursor = event_sequence()
+        with patch("lights.protocols.mqtt.set_light") as send:
+            scene.activate({"recall": {"action": "active"}})
+        send.assert_called_once()
+        self.assertEqual(self.brightness_events(cursor),
+                         {self.second.id_v2: 50, self.room.id_v2: 50})
+        cursor = event_sequence()
+        apply_report(self.second, {"on": True, "bri": 127}, self.bridge["groups"])
+        self.assertEqual(events_after(cursor, 0), [])
+
+    def test_mqtt_scene_sends_each_lamps_brightness_and_color_in_one_batch(self):
+        scene = Scene({"id_v1": "4", "name": "Reading", "owner": None})
+        broker = {"mqttUser": "", "mqttPassword": "", "mqttServer": "broker", "mqttPort": 1883}
+        for light, hue, brightness in ((self.first, 0, 64), (self.second, 32000, 240)):
+            light.protocol = "mqtt"
+            light.protocol_cfg.update(ip="mqtt", command_topic=f"z2m/{light.id_v1}/set", mqtt_server=broker)
+            light.state.update(hue=hue, sat=254)
+            scene.lightstates[light] = {"on": True, "sat": 200, "bri": brightness}
+        self.second.protocol_cfg["max_bri"] = 127
+        with patch("lights.protocols.mqtt.publish.multiple") as send:
+            scene.activate({"recall": {"action": "active"}})
+        send.assert_called_once()
+        payloads = {m["topic"]: json.loads(m["payload"]) for m in send.call_args.args[0]}
+        for light, hue, brightness in ((self.first, 0, 64), (self.second, 32000, 127)):
+            payload = payloads[light.protocol_cfg["command_topic"]]
+            self.assertEqual(payload["brightness"], brightness)
+            self.assertEqual(payload["color"], dict(zip(("r", "g", "b"), hsv_to_rgb(hue, 200, brightness))))
+            self.assertEqual(light.state["bri"], brightness)
+        self.assertEqual(scene.lightstates[self.second]["bri"], 240)
+
+    def test_room_with_one_lit_lamp_reports_its_exact_brightness(self):
+        cursor = event_sequence()
+        self.second.setV1State({"on": True, "bri": 1})
+        brightness = self.second.getV2Api()["dimming"]["brightness"]
+        self.assertEqual(self.room.getV2GroupedLight()["dimming"]["brightness"], brightness)
+        self.assertEqual(self.brightness_events(cursor)[self.room.id_v2], brightness)
+
+    def test_report_during_mqtt_group_write_wins_over_command(self):
+        self.second.protocol = "mqtt"
+        self.second.protocol_cfg.update(ip="broker", command_topic="z2m/lamp/set")
+        cursor = event_sequence()
+        def device_correction(*args):
+            apply_report(self.second, {"bri": 127}, self.bridge["groups"])
+        with patch("lights.protocols.homeassistant_ws.set_light"), \
+                patch("lights.protocols.mqtt.set_light", side_effect=device_correction):
+            self.room.setV2Action({"on": {"on": True}, "dimming": {"brightness": 100}})
+        self.assertEqual(self.brightness_events(cursor),
+                         {self.first.id_v2: 100, self.second.id_v2: 50, self.room.id_v2: 75})
+
+    def test_failed_mqtt_scene_write_keeps_previous_brightness(self):
+        self.second.protocol = "mqtt"
+        self.second.protocol_cfg.update(ip="broker", command_topic="z2m/lamp/set")
+        self.second.state.update(on=True, bri=127)
+        scene = Scene({"id_v1": "4", "name": "Reading", "owner": None})
+        scene.lightstates[self.second] = {"on": True, "bri": 254}
+        cursor = event_sequence()
+        with patch("lights.protocols.mqtt.set_light", side_effect=ConnectionError):
+            scene.activate({"recall": {"action": "active"}})
+        self.assertEqual(self.brightness_events(cursor), {self.second.id_v2: 50, self.room.id_v2: 50})
+        self.assertEqual(self.second.state["bri"], 127)
+
+    def test_home_assistant_maximum_brightness_round_trip(self):
+        change = row("on", 4)
+        change["attributes"]["brightness"] = 255
+        cursor = event_sequence()
+        self.client.do_state_changed({"event": {"data": {"entity_id": "light.test1", "new_state": change}}})
+        self.assertEqual(self.brightness_events(cursor), {self.first.id_v2: 100, self.room.id_v2: 100})
+        self.client.change_light(self.first, {"bri": self.first.state["bri"]})
+        self.assertEqual(self.client._send.call_args.args[0]["service_data"]["brightness"], 255)
+
+    def test_room_dimmer_steps_from_level_reported_by_home_assistant(self):
+        change = row("on", 4)
+        change["attributes"]["brightness"] = 51
+        self.client.do_state_changed({"event": {"data": {"entity_id": "light.test1", "new_state": change}}})
+        with patch("lights.protocols.homeassistant_ws.set_light"):
+            self.room.setV1Action({"bri_inc": 30})
+        self.assertEqual(self.first.state["bri"], 81)
+
+    def test_grouped_light_owner_matches_events_in_rooms_and_zones(self):
+        zone = Group({"id_v1": "2", "type": "Zone"})
+        zone.add_light(self.second)
+        self.bridge["groups"]["2"] = zone
+        cursor = event_sequence()
+        self.second.setV1State({"on": True, "bri": 127})
+        owners = {r["id"]: r["owner"] for _, event in events_after(cursor, 0)
+                  for r in event["data"] if r["type"] == "grouped_light"}
+        for group, resource in ((self.room, self.room.getV2Room()), (zone, zone.getV2Zone())):
+            expected = {"rid": resource["id"], "rtype": resource["type"]}
+            self.assertEqual(owners[group.id_v2], expected)
+            self.assertEqual(group.getV2GroupedLight()["owner"], expected)
+
     def test_failed_ha_command_preserves_on_state_and_reports_failure(self):
         with patch("lights.protocols.homeassistant_ws.set_light", side_effect=ConnectionError):
             self.assertIs(self.first.setV2State({"on": {"on": True}}), False)
@@ -98,6 +219,47 @@ class HueStateUpdates(unittest.TestCase):
         self.assertFalse(self.client.authenticated.is_set())
         create.assert_called_once()
         self.assertIs(ha.homeassistant_ws_client, replacement)
+
+    def test_external_brightness_change_reaches_connected_and_reconnecting_apps(self):
+        app = Flask(__name__)
+        app.register_blueprint(eventStreamer.stream)
+        client = app.test_client()
+        self.enterContext(patch.object(v2restapi, "bridgeConfig", self.bridge))
+        self.enterContext(patch.object(eventStreamer, "stream_events_after",
+                          side_effect=lambda cursor: stream_events_after(cursor, timeout=0)))
+
+        def connect(last=None):
+            headers = {"hue-application-key": "key"}
+            if last is not None:
+                headers["Last-Event-ID"] = last
+            response = client.get("/eventstream/clip/v2", headers=headers, buffered=False)
+            self.addCleanup(response.close)
+            frames = iter(response.response)
+            self.assertIn(b": hi", next(frames))
+            return frames
+
+        def read_levels(frame):
+            data = next((line[6:] for line in frame.decode().splitlines() if line.startswith("data: ")), "[]")
+            return {r["id"]: r["dimming"]["brightness"] for event in json.loads(data)
+                    for r in event["data"] if "dimming" in r}
+
+        def ha_event(brightness, second):
+            state = row("on", second)
+            state["attributes"]["brightness"] = brightness
+            event = {"type": "event", "event": {"event_type": "state_changed", "data": {
+                "entity_id": "light.test1", "new_state": state}}}
+            self.client.received_message(SimpleNamespace(data=json.dumps(event).encode(), encoding="utf-8"))
+
+        ha_event(26, 1)
+        live = connect(str(event_sequence()))
+        ha_event(255, 2)  # The automation changes brightness while the light stays on.
+        self.assertEqual(read_levels(next(live)), {self.first.id_v2: 100})
+        next(live)  # device metadata
+        self.assertEqual(read_levels(next(live)), {self.room.id_v2: 100})
+        for checkpoint in (None, "0:999999"):
+            levels = read_levels(next(connect(checkpoint)))
+            self.assertEqual(levels.get(self.first.id_v2), 100)
+            self.assertEqual(levels.get(self.room.id_v2), 100)
 
     def test_event_stream_clients_receive_identical_events_and_resume(self):
         app = Flask(__name__)

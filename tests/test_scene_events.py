@@ -59,7 +59,7 @@ class SceneEvents(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return self.path + "/" + response.json["data"][0]["rid"]
 
-    def subscribe(self, headers=None):
+    def subscribe(self, headers=None, *, resume=False, deleted=()):
         # Keep the real Flask stream open across writes. A missing event returns
         # a keepalive immediately so regressions fail without hanging the tests.
         self.enterContext(patch.object(eventStreamer, "stream_events_after",
@@ -68,6 +68,14 @@ class SceneEvents(unittest.TestCase):
         self.addCleanup(response.close)
         frames = iter(response.response)
         self.assertIn(b": hi", next(frames))
+        if not resume:
+            frame = next(frames).decode()
+            self.assertRegex(frame, r"^id: [0-9]+:[0-9]+\n")
+            *recovery, snapshot = json.loads(frame.split("data: ", 1)[1])
+            self.assertEqual([e["type"] for e in recovery], ["delete"] * len(deleted))
+            self.assertEqual([e["data"][0]["id"] for e in recovery], list(deleted))
+            self.assertEqual(snapshot["type"], "update")
+            self.assertEqual({r["type"] for r in snapshot["data"]}, {"light", "grouped_light"})
         return frames
 
     def next_event(self, frames, kind):
@@ -102,8 +110,7 @@ class SceneEvents(unittest.TestCase):
         self.assertEqual(self.client.delete(path).status_code, 200)
         StreamEvent({"type": "update", "data": [{"id": "other", "type": "button"}]})
         for headers in (None, {"Last-Event-ID": "1:9999"}):
-            frames = self.subscribe(headers)
-            self.assertEqual(self.next_event(frames, "delete")["id"], rid)
+            frames = self.subscribe(headers, deleted=(rid,))
             self.assertIn(b": keepalive", next(frames))
         self.users["other-key"] = SimpleNamespace(username="other-key")
         other = self.subscribe({"hue-application-key": "other-key"})
@@ -125,7 +132,7 @@ class SceneEvents(unittest.TestCase):
         self.client.delete(path)
         wire_line, data_line = next(frames).decode().strip().splitlines()
         self.assertEqual(json.loads(data_line[6:])[0]["type"], "delete")
-        resumed = self.subscribe({"Last-Event-ID": wire_line.removeprefix("id: ")})
+        resumed = self.subscribe({"Last-Event-ID": wire_line.removeprefix("id: ")}, resume=True)
         self.assertIn(b": keepalive", next(resumed))
 
     def test_smart_scene_delete_uses_its_storage_key_and_notifies_once(self):

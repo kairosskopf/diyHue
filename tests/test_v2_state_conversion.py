@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "BridgeEmulator"))
 
 import logManager  # noqa: E402
 logManager.logger.configure_logger("CRITICAL")
-from HueObjects import v2StateToV1  # noqa: E402
+from HueObjects import v1StateToV2, v2StateToV1  # noqa: E402
 
 
 class V2StateToV1Tests(unittest.TestCase):
@@ -14,6 +14,11 @@ class V2StateToV1Tests(unittest.TestCase):
         # v2 durations are in milliseconds, v1 transitiontime in 100 ms steps.
         state = v2StateToV1({"on": {"on": True}, "dimming": {"brightness": 50}, "dynamics": {"duration": 4000}})
         self.assertEqual(state, {"on": True, "bri": 127, "transitiontime": 40})
+
+    def test_resubmitting_reported_brightness_preserves_every_hue_level(self):
+        for level in range(255):
+            with self.subTest(level=level):
+                self.assertEqual(v2StateToV1(v1StateToV2({"bri": level})), {"bri": level})
 
     def test_short_durations_are_rounded(self):
         self.assertEqual(v2StateToV1({"dynamics": {"duration": 0}})["transitiontime"], 0)

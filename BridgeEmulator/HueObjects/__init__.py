@@ -63,10 +63,10 @@ def stream_start(last_id, user):
             if last_id.isascii() and last_id.isdecimal() and len(last_id) < 20:
                 seq = int(last_id)
                 if first - 1 <= seq <= current:
-                    return seq, [], "resume"
+                    return seq, [], "resume", None
             for seq in range(current, first - 1, -1):
                 if _event_headers[seq][0] == last_id:
-                    return seq, [], "resume"
+                    return seq, [], "resume", None
 
         # Without a checkpoint we cannot safely repeat button presses or older
         # light states. Re-send only this app's recent scene deletions. A later
@@ -83,7 +83,9 @@ def stream_start(last_id, user):
                     if event.get("type") == "add":
                         for resource in event.get("data", []):
                             pending.pop(resource.get("id"), None)
-        return current, list(pending.values()), "unknown checkpoint" if last_id else "no checkpoint"
+        mode = "unknown checkpoint" if last_id else "no checkpoint"
+        wire_id = _event_headers[current][0] if current in _event_headers else None
+        return current, list(pending.values()), mode, wire_id
 
 
 def v1StateToV2(v1State):
@@ -103,7 +105,7 @@ def v1StateToV2(v1State):
 def v2StateToV1(v2State):
     v1State = {}
     if "dimming" in v2State:
-        v1State["bri"] = int(v2State["dimming"]["brightness"] * 2.54)
+        v1State["bri"] = round(v2State["dimming"]["brightness"] * 2.54)
     if "on" in v2State:
         v1State["on"] = v2State["on"]["on"]
     if "color_temperature" in v2State:
@@ -129,6 +131,91 @@ def generate_unique_id():
     return "00:17:88:01:00:%02x:%02x:%02x-0b" % (rand_bytes[0], rand_bytes[1], rand_bytes[2])
 
 
+def publish_group_brightness(lights, groups=None, exclude=None):
+    if not lights:
+        return
+    if groups is None:
+        import configManager
+        groups = configManager.bridgeConfig.yaml_config.get("groups", {})
+    for group in list(groups.values()):
+        if group is exclude or (group.type not in ("Room", "Zone") and group.id_v1 != "0"):
+            continue
+        if any(ref() in lights for ref in group.lights):
+            group.genStreamEvent({"dimming": {}})
+
+
+def limit_brightness(state, config):
+    if "bri" in state:
+        brightness = state["bri"]
+        if "min_bri" in config:
+            brightness = max(brightness, config["min_bri"])
+        if "max_bri" in config:
+            brightness = min(brightness, config["max_bri"])
+        state["bri"] = brightness
+
+
+def send_light_batch(batch, changed):
+    sender = next(iter(batch.values()))[0]
+    payload = {}
+    staged = {}
+    for address, (light, state) in batch.items():
+        # An echo can arrive during the network write. Stage first so that a
+        # correction from the device wins and is included in the final event.
+        old = {key: light.state[key] for key in state if key in light.state}
+        if "colormode" in light.state:
+            old["colormode"] = light.state["colormode"]
+        light.state.update({key: state[key] for key in state if key in light.state})
+        light.updateLightState(state)
+        staged[light] = {key: (value, light.state[key]) for key, value in old.items()}
+        payload[address] = state
+
+    command = {"lights": payload}
+    if sender.protocol == "mqtt":
+        command["members"] = {address: light for address, (light, _) in batch.items()}
+    sent = sender.setV1State(command) is not False
+    for light, state in batch.values():
+        if not sent:
+            for key, (old, requested) in staged[light].items():
+                if light.state[key] == requested:
+                    light.state[key] = old
+        elif state.get("on") is False:
+            light.dynamics["status"] = "none"
+        fields = v1StateToV2(state)
+        if not sent:
+            current = light.getV2Api()
+            fields = {key: current[key] for key in fields if key in current}
+        light.genStreamEvent(fields, groups={})
+        if "bri" in state or "on" in state:
+            changed.add(light)
+
+
+def set_light_actions(actions, *, group=None):
+    """Dispatch per-lamp states, retaining one network write per batch-capable device."""
+    batches = {}
+    changed = set()
+    try:
+        for light, state in actions:
+            state = state.copy()
+            if light.protocol not in ("native_multi", "mqtt"):
+                light.setV1State(state, group_changes=changed)
+                continue
+
+            # A brightness-only group command must not wake an off MQTT light.
+            if group is not None and light.protocol == "mqtt" and "bri" in state and not state.get("on", light.state["on"]):
+                if "on" not in state:
+                    continue
+                del state["bri"]
+            limit_brightness(state, light.protocol_cfg)
+            address = light.protocol_cfg["light_nr" if light.protocol == "native_multi" else "command_topic"]
+            batch = batches.setdefault((light.protocol, light.protocol_cfg["ip"]), {})
+            batch[address] = (light, state)
+
+        for batch in batches.values():
+            send_light_batch(batch, changed)
+    finally:
+        publish_group_brightness(changed, exclude=group)
+
+
 def setGroupAction(group, state, scene=None):
     lightsState = {}
     if scene != None:
@@ -139,6 +226,12 @@ def setGroupAction(group, state, scene=None):
                 group.state["any_on"] = True
 
     else:
+        if "bri_inc" in state:
+            members = (ref() for ref in group.lights)
+            levels = [light.state["bri"] for light in members if light is not None
+                      and light.state.get("on") and isinstance(light.state.get("bri"), (int, float))]
+            if levels:
+                group.action["bri"] = round(sum(levels) / len(levels))
         state = incProcess(group.action, state)
         for light in group.lights:
             if light():
@@ -160,37 +253,12 @@ def setGroupAction(group, state, scene=None):
             group.state["all_on"] = state["on"]
         group.action.update(state)
 
-    queueState = {}
-    for light in group.lights:
-        if light() and light().id_v1 in lightsState:  # apply only if the light belong to this group
-            for key, value in lightsState[light().id_v1].items():
-                if key in light().state:
-                    light().state[key] = value
-            light().updateLightState(lightsState[light().id_v1])
-            # apply max and min brightness limis
-            if "bri" in lightsState[light().id_v1]:
-                if "min_bri" in light().protocol_cfg and light().protocol_cfg["min_bri"] > lightsState[light().id_v1]["bri"]:
-                    lightsState[light().id_v1]["bri"] = light().protocol_cfg["min_bri"]
-                if "max_bri" in light().protocol_cfg and light().protocol_cfg["max_bri"] < lightsState[light().id_v1]["bri"]:
-                    lightsState[light().id_v1]["bri"] = light().protocol_cfg["max_bri"]
-                if  light().protocol == "mqtt" and not light().state["on"]:
-                    continue
-            # end limits
-            if light().protocol in ["native_multi", "mqtt"]:
-                light().genStreamEvent(v1StateToV2(lightsState[light().id_v1]))
-                if light().protocol_cfg["ip"] not in queueState:
-                    queueState[light().protocol_cfg["ip"]] = {
-                        "object": light(), "lights": {}}
-                if light().protocol == "native_multi":
-                    queueState[light().protocol_cfg["ip"]]["lights"][light(
-                    ).protocol_cfg["light_nr"]] = lightsState[light().id_v1]
-                elif light().protocol == "mqtt":
-                    queueState[light().protocol_cfg["ip"]]["lights"][light(
-                    ).protocol_cfg["command_topic"]] = lightsState[light().id_v1]
-            else:
-                light().setV1State(lightsState[light().id_v1])
-    for device, state in queueState.items():
-        state["object"].setV1State(state)
+    members = (ref() for ref in group.lights)
+    actions = [(light, lightsState[light.id_v1]) for light in members
+               if light is not None and light.id_v1 in lightsState]
+    set_light_actions(actions, group=group)
+    if scene is not None:
+        group.genStreamEvent({"dimming": {}})
 
     group.state = group.update_state()
 

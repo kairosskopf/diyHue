@@ -20,6 +20,14 @@ def state_content(row):
     return row['entity_id'], row['state'], row['attributes']
 
 
+def hue_brightness(value):
+    return max(0, min(254, round(value * 254 / 255)))
+
+
+def ha_brightness(value):
+    return max(0, min(255, round(value * 255 / 254)))
+
+
 def translate(existing, row):
     result = deepcopy(existing)
     available = row['state'] in ('on', 'off')
@@ -29,7 +37,9 @@ def translate(existing, row):
     result['on'] = row['state'] == 'on'
     attrs = row['attributes']
     if result['on']:
-        for source, target in [('brightness', 'bri'), ('color_temp', 'ct'), ('xy_color', 'xy')]:
+        if isinstance(attrs.get('brightness'), (int, float)):
+            result['bri'] = hue_brightness(attrs['brightness'])
+        for source, target in [('color_temp', 'ct'), ('xy_color', 'xy')]:
             if source in attrs and attrs[source] is not None:
                 result[target] = deepcopy(attrs[source])
         mode = attrs.get('color_mode')

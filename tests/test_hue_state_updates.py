@@ -126,6 +126,13 @@ class HueStateUpdates(unittest.TestCase):
             self.assertEqual(light.state["bri"], brightness)
         self.assertEqual(scene.lightstates[self.second]["bri"], 240)
 
+    def test_reconnect_with_legacy_full_brightness_is_within_hue_range(self):
+        self.first.state.update(on=True, bri=255)
+        self.second.state.update(on=True, bri=127)
+        snapshot = eventStreamer.current_light_levels(self.bridge)
+        levels = {r["id"]: r["dimming"]["brightness"] for r in snapshot["data"]}
+        self.assertEqual(levels, {self.first.id_v2: 100, self.second.id_v2: 50, self.room.id_v2: 75})
+
     def test_room_with_one_lit_lamp_reports_its_exact_brightness(self):
         cursor = event_sequence()
         self.second.setV1State({"on": True, "bri": 1})

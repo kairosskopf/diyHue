@@ -3,7 +3,7 @@ import logManager
 import weakref
 from threading import Thread
 from datetime import datetime, timezone
-from HueObjects import genV2Uuid, StreamEvent, set_light_actions
+from HueObjects import genV2Uuid, StreamEvent, set_light_actions, brightness_percent
 
 logging = logManager.logger.get_logger(__name__)
 
@@ -161,12 +161,7 @@ class Scene():
             if "on" in state:
                 v2State["on"] = {"on": state["on"]}
             if "bri" in state:
-                bri_value = state["bri"]
-                if bri_value is None or bri_value == "null":
-                    bri_value = 1
-                v2State["dimming"] = {
-                    "brightness": round(float(bri_value) / 2.54, 2)
-                }
+                v2State["dimming"] = {"brightness": brightness_percent(state["bri"])}
                 #v2State["dimming_delta"] = {}
 
             if "xy" in state:

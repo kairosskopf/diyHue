@@ -142,7 +142,7 @@ class Group():
                 if "on" in light().state and light().state["on"]:
                     any_on = True
                     if isinstance(light().state.get("bri"), (int, float)):
-                        bri = bri + light().state["bri"]
+                        bri += max(0, min(254, light().state["bri"]))
                         lights_on = lights_on + 1
                 else:
                     all_on = False

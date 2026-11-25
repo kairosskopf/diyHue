@@ -88,12 +88,19 @@ def stream_start(last_id, user):
         return current, list(pending.values()), mode, wire_id
 
 
+def brightness_percent(level):
+    # Older persisted states and some integrations use 255 for full brightness.
+    if level is None or level == "null":
+        level = 1
+    return round(max(0, min(254, float(level))) / 2.54, 2)
+
+
 def v1StateToV2(v1State):
     v2State = {}
     if "on" in v1State:
         v2State["on"] = {"on": v1State["on"]}
     if "bri" in v1State:
-        v2State["dimming"] = {"brightness": round(v1State["bri"] / 2.54, 2)}
+        v2State["dimming"] = {"brightness": brightness_percent(v1State["bri"])}
     if "ct" in v1State:
         v2State["color_temperature"] = {"mirek": v1State["ct"], "color_temperature_delta": {}}
     if "xy" in v1State:

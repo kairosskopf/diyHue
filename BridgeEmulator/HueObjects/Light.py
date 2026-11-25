@@ -2,7 +2,7 @@ import uuid
 import logManager
 from lights.light_types import lightTypes, archetype
 from lights.protocols import protocols, wled
-from HueObjects import genV2Uuid, incProcess, v1StateToV2, generate_unique_id, v2StateToV1, StreamEvent, limit_brightness, publish_group_brightness
+from HueObjects import genV2Uuid, incProcess, v1StateToV2, generate_unique_id, v2StateToV1, StreamEvent, limit_brightness, publish_group_brightness, brightness_percent
 from datetime import datetime, timezone
 from copy import deepcopy
 from time import sleep
@@ -362,11 +362,8 @@ class Light():
                 "ct"] != None and self.state["ct"] < 500 and self.state["ct"] > 153 else False
             result["color_temperature_delta"] = {}
         if "bri" in self.state:
-            bri_value = self.state["bri"]
-            if bri_value is None or bri_value == "null":
-                bri_value = 1
             result["dimming"] = {
-                "brightness": round(float(bri_value) / 2.54, 2),
+                "brightness": brightness_percent(self.state["bri"]),
                 "min_dim_level": 0.1  # Adjust this value as needed
             }
             result["dimming_delta"] = {}

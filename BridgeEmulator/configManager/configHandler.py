@@ -402,6 +402,7 @@ class Config:
                             if light in self.yaml_config["lights"]:
                                 lightObj = self.yaml_config["lights"][light]
                                 self.yaml_config["scenes"][scene].lightstates[lightObj] = lightstate
+                        self.yaml_config["scenes"][scene].publish_event("add")
                     except Exception as e:
                         logging.error(f"Skipping corrupt scene {scene}: {e}")
         #smart_scene

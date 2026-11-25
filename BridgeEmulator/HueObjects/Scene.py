@@ -7,6 +7,12 @@ from HueObjects import genV2Uuid, StreamEvent
 
 logging = logManager.logger.get_logger(__name__)
 
+def remove_scene(scenes, key):
+    """Remove the registered resource before notifying open Hue clients."""
+    scene = scenes.pop(key)
+    scene.publish_event("delete")
+
+
 class Scene():
 
     DEFAULT_SPEED = 0.6269841194152832
@@ -30,25 +36,15 @@ class Scene():
         self.lights = data["lights"] if "lights" in data else []
         self.status = data["status"] if "status" in data else "inactive"
         if "group" in data:
-            self.storelightstate()
             self.lights = self.group().lights
-        streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         "data": [self.getV2Api()],
-                         "id": str(uuid.uuid4()),
-                         "type": "add"
-                         }
-        streamMessage["data"][0].update(self.getV2Api())
-        StreamEvent(streamMessage)
+            if "lightstates" not in data and "actions" not in data:
+                self.storelightstate()
 
-    def __del__(self):
-        streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         "data": [{"id": self.id_v2, "type": "scene"}],
-                         "id": str(uuid.uuid4()),
-                         "type": "delete"
-                         }
-        streamMessage["id_v1"] = "/scenes/" + self.id_v1
-        StreamEvent(streamMessage)
-        logging.info(self.name + " scene was destroyed.")
+    def publish_event(self, kind):
+        resource = ({"id": self.id_v2, "id_v1": "/scenes/" + self.id_v1, "type": "scene"}
+                    if kind == "delete" else self.getV2Api())
+        StreamEvent({"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "id": genV2Uuid(), "type": kind, "data": [resource]})
 
     def add_light(self, light):
         self.lights.append(light)
@@ -190,6 +186,8 @@ class Scene():
             if "ct" in state:
                 v2State["color_temperature"] = {
                     "mirek": state["ct"]}
+            if "gradient" in state:
+                v2State["gradient"] = state["gradient"]
             result["actions"].append(
                 {
                     "action": v2State,
@@ -223,16 +221,10 @@ class Scene():
         return result
 
     def storelightstate(self):
-        lights = []
-        if self.type == "GroupScene":
-            for light in self.group().lights:
-                if light():
-                    lights.append(light)
-        else:
-            for light in self.lightstates.keys():
-                if light():
-                    lights.append(light)
+        lights = self.group().lights if self.type == "GroupScene" else self.lights
         for light in lights:
+            if light() is None:
+                continue
             if "on" not in light().state:
                 continue
             state = {}
@@ -253,14 +245,21 @@ class Scene():
         self.lastupdated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
         if "storelightstate" in newdata and newdata["storelightstate"]:
             self.storelightstate()
+            self.publish_event("update")
             return
         for key, value in newdata.items():
+            if key == "lightstates" and isinstance(value, dict):
+                for light, changes in value.items():
+                    self.lightstates.setdefault(light, {}).update(changes)
+                continue
             updateAttribute = getattr(self, key)
             if isinstance(updateAttribute, dict):
                 updateAttribute.update(value)
                 setattr(self, key, updateAttribute)
             else:
                 setattr(self, key, value)
+
+        self.publish_event("update")
 
     def getObjectPath(self):
         return {"resource": "scenes", "id": self.id_v1}
@@ -275,7 +274,7 @@ class Scene():
                 return False
         if self.palette != None:
             result["palette"] = self.palette
-        result["speed"] = self.speed or self.DEFAULT_SPEED
+        result["speed"] = self.speed if self.speed is not None else self.DEFAULT_SPEED
         for light in self.lights:
             if light():
                 result["lights"].append(light().id_v1)

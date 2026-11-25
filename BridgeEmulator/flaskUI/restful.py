@@ -11,6 +11,7 @@ from lights.discover import scanForLights, manualAddLight
 from sensors.sensor_types import MOTION_SENSOR_MODELS
 from functions.core import capabilities, staticConfig, nextFreeId
 from flask_restful import Resource
+from flaskUI import serialize_scene_writes
 from flask import request
 from functions.rules import rulesProcessor
 from services.entertainment import entertainmentService
@@ -145,6 +146,7 @@ class ResourceElements(Resource):
             return {"name": config["name"], "datastoreversion": staticConfig()["datastoreversion"], "swversion": config["swversion"], "apiversion": config["apiversion"], "mac": config["mac"], "bridgeid": config["bridgeid"], "factorynew": False, "replacesbridgeid": None, "modelid": staticConfig()["modelid"], "starterkitid": ""}
         return [{"error": {"type": 1, "address": "/", "description": "unauthorized user"}}]
 
+    @serialize_scene_writes
     def post(self, username, resource):
         authorisation = authorize(username, resource)
         if "success" not in authorisation:
@@ -240,7 +242,9 @@ class ResourceElements(Resource):
         elif resource == "schedules":
             bridgeConfig[resource][new_object_id] = Schedule.Schedule(postDict)
         newObject = bridgeConfig[resource][new_object_id]
-        if v2Resource != "none":
+        if resource == "scenes":
+            newObject.publish_event("add")
+        elif v2Resource != "none":
             streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                              "data": [],
                              "id_v1": "/" + resource + "/" + new_object_id,
@@ -329,6 +333,7 @@ class Element(Resource):
             return bridgeConfig[resource][resourceid].getV1Api()
         return bridgeConfig[resource][resourceid]
 
+    @serialize_scene_writes
     def put(self, username, resource, resourceid):
         authorisation = authorize(username, resource, resourceid)
         if "success" not in authorisation:
@@ -387,15 +392,19 @@ class Element(Resource):
                 for scene in list(bridgeConfig["scenes"].keys()):
                     if bridgeConfig["scenes"][scene].type == "GroupScene":
                         if bridgeConfig["scenes"][scene].group().id_v1 == resourceid:
-                            del bridgeConfig["scenes"][scene]
+                            Scene.remove_scene(bridgeConfig["scenes"], scene)
+                            configManager.bridgeConfig.mark_dirty("scenes")
             if "locations" in putDict:
                 for light, location in putDict["locations"].items():
                     bridgeConfig["groups"][resourceid].locations[bridgeConfig["lights"][light]] = [{"x": location[0], "y": location[1], "z": location[2]}]
         bridgeConfig[resource][resourceid].update_attr(putDict)
+        if resource == "scenes":
+            configManager.bridgeConfig.mark_dirty(resource)
         rulesProcessor(bridgeConfig[resource][resourceid], currentTime)
         logging.debug(responseList)
         return responseList
 
+    @serialize_scene_writes
     def delete(self, username, resource, resourceid):
         authorisation = authorize(username, resource, resourceid)
         if "success" not in authorisation:
@@ -405,7 +414,11 @@ class Element(Resource):
                 try:
                     pices = link.split("/")
                     if hasattr(bridgeConfig[pices[1]][pices[2]], "recycle") and bridgeConfig[pices[1]][pices[2]].recycle:
-                        del bridgeConfig[pices[1]][pices[2]]
+                        if pices[1] == "scenes":
+                            Scene.remove_scene(bridgeConfig["scenes"], pices[2])
+                            configManager.bridgeConfig.mark_dirty("scenes")
+                        else:
+                            del bridgeConfig[pices[1]][pices[2]]
                 except:
                     logging.info("link not found")
             configManager.bridgeConfig.mark_dirty("resourcelinks")
@@ -414,15 +427,16 @@ class Element(Resource):
             for sensor in list(bridgeConfig["sensors"].keys()):
                 if bridgeConfig["sensors"][sensor].uniqueid != None and bridgeConfig["sensors"][sensor].uniqueid[:-1] == bridgeConfig["sensors"][resourceid].uniqueid[:-1] and bridgeConfig["sensors"][sensor].id_v1 != resourceid:
                     del bridgeConfig["sensors"][sensor]
-        # delete the object
-        del bridgeConfig[resource][resourceid]
-        # clean scenes
         if resource == "groups":
-            for scene in list(bridgeConfig["scenes"].keys()):
-                if bridgeConfig["scenes"][scene].type == "GroupScene":
-                    if bridgeConfig["scenes"][scene].group().id_v1 == resourceid:
-                        del bridgeConfig["scenes"][scene]
-            configManager.bridgeConfig.mark_dirty("scenes")  # cascaded scene deletions
+            group = bridgeConfig["groups"][resourceid]
+            for key, scene in list(bridgeConfig["scenes"].items()):
+                if scene.type == "GroupScene" and scene.group() is group:
+                    Scene.remove_scene(bridgeConfig["scenes"], key)
+            configManager.bridgeConfig.mark_dirty("scenes")
+        if resource == "scenes":
+            Scene.remove_scene(bridgeConfig["scenes"], resourceid)
+        else:
+            del bridgeConfig[resource][resourceid]
         if resource in ["groups", "lights"]:
             GroupZeroMessage() # trigger stream messages
         if resource == "lights":
@@ -518,6 +532,7 @@ class ElementParamId(Resource):
             return authorisation
         return bridgeConfig[resource][resourceid].getV1Api()[param][paramid]
 
+    @serialize_scene_writes
     def put(self, username, resource, resourceid, param, paramid):
         authorisation = authorize(username, resource, resourceid, param)
         if "success" not in authorisation:
@@ -535,5 +550,7 @@ class ElementParamId(Resource):
             paramid = bridgeConfig["lights"][paramid]
         bridgeConfig[resource][resourceid].update_attr(
             {param: {paramid: putDict}})
+        if resource == "scenes":
+            configManager.bridgeConfig.mark_dirty(resource)
         logging.debug(responseList)
         return responseList

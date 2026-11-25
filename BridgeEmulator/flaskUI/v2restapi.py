@@ -5,6 +5,7 @@ import uuid
 import json
 import weakref
 from flask_restful import Resource
+from flaskUI import serialize_scene_writes
 from flask import request
 from services.entertainment import entertainmentService
 from services.updateManager import bridge_software_version
@@ -35,12 +36,16 @@ def stopSmartScenesOn(group):
 
 
 def getObject(element, v2uuid):
+    if element == "scene":
+        # A reader can hold a removed Scene alive. The registry is authoritative.
+        return next((scene for scene in list(bridgeConfig["scenes"].values())
+                     if scene.id_v2 == v2uuid), None)
     if element in ["behavior_instance"]:
         return bridgeConfig[element][v2uuid]
     elif element in v2Resources and v2uuid in v2Resources[element]:
         logging.debug("Cache Hit for " + element)
         return v2Resources[element][v2uuid]()
-    elif element in ["light", "scene", "grouped_light", "smart_scene"]:
+    elif element in ["light", "grouped_light", "smart_scene"]:
         for v1Element in ["lights", "groups", "scenes", "smart_scene"]:
             for key, obj in bridgeConfig[v1Element].items():
                 if obj.id_v2 == v2uuid:
@@ -65,6 +70,18 @@ def getObject(element, v2uuid):
                     return obj
     logging.info("element not found!")
     return False
+
+
+def scene_actions(actions):
+    from HueObjects import v2StateToV1
+    states = weakref.WeakKeyDictionary()
+    for entry in actions:
+        target = entry.get("target", {})
+        if target.get("rtype") == "light":
+            light = getObject("light", target.get("rid"))
+            if light:
+                states[light] = v2StateToV1(entry["action"])
+    return states
 
 
 def authorizeV2(headers):
@@ -453,6 +470,7 @@ class ClipV2Resource(Resource):
 
         return response
 
+    @serialize_scene_writes
     def post(self, resource):
         # logging.debug(request.headers)
         authorisation = authorizeV2(request.headers)
@@ -464,53 +482,30 @@ class ClipV2Resource(Resource):
         newObject = None
         if resource == "scene":
             new_object_id = nextFreeId(bridgeConfig, "scenes")
-            objCreation = {
-                "id_v1": new_object_id,
-                "name": postDict["metadata"]["name"],
-                "image": postDict["metadata"]["image"]["rid"] if "image" in postDict["metadata"] else None,
-                "owner": apiUser,
-            }
+            objCreation = dict(postDict, id_v1=new_object_id, owner=apiUser,
+                               name=postDict["metadata"]["name"],
+                               image=(postDict["metadata"].get("image") or {}).get("rid"))
             if "group" in postDict:
-                objCreation["group"] = weakref.ref(
-                    getObject(postDict["group"]["rtype"], postDict["group"]["rid"]))
+                group = getObject(postDict["group"]["rtype"], postDict["group"]["rid"])
+                if not group:
+                    return {"data": [], "errors": [{"description": "Scene group not found"}]}, 400
+                objCreation["group"] = weakref.ref(group)
                 objCreation["type"] = "GroupScene"
-                del postDict["group"]
             elif "lights" in postDict:
-                objCreation["type"] = "LightScene"
-                objLights = []
-                for light in postDict["lights"]:
-                    objLights.append(getObject(light["rtype"], light["rid"]))
-                objCreation["lights"] = objLights
-            objCreation.update(postDict)
+                objCreation["lights"] = []
+                for target in postDict["lights"]:
+                    light = getObject("light", target["rid"])
+                    if light:
+                        objCreation["lights"].append(weakref.ref(light))
             newObject = Scene.Scene(objCreation)
+            if "actions" in postDict:
+                newObject.lightstates = scene_actions(postDict["actions"])
+                if not newObject.group and "lights" not in postDict:
+                    newObject.lights = [weakref.ref(light) for light in newObject.lightstates]
             bridgeConfig["scenes"][new_object_id] = newObject
             configManager.bridgeConfig.mark_dirty("scenes")
-            if "actions" in postDict:
-                for action in postDict["actions"]:
-                    if "target" in action:
-                        if action["target"]["rtype"] == "light":
-                            lightObj = getObject(
-                                "light",  action["target"]["rid"])
-                            sceneState = {}
-                            scene = action["action"]
-                            if "on" in scene:
-                                sceneState["on"] = scene["on"]["on"]
-                            if "dimming" in scene:
-                                sceneState["bri"] = int(
-                                    scene["dimming"]["brightness"] * 2.54)
-                            if "color" in scene:
-                                if "xy" in scene["color"]:
-                                    sceneState["xy"] = [
-                                        scene["color"]["xy"]["x"], scene["color"]["xy"]["y"]]
-                            if "color_temperature" in scene:
-                                if "mirek" in scene["color_temperature"]:
-                                    sceneState["ct"] = scene["color_temperature"]["mirek"]
-                            if "gradient" in scene:
-                                sceneState["gradient"] = scene["gradient"]
-                            newObject.lightstates[lightObj] = sceneState
-            # Persist immediately so the scene survives a bridge restart.
-            # The v1 REST API always saved after scene writes; the v2 path was missing this.
-            configManager.bridgeConfig.save_config(backup=False, resource="scenes")
+            configManager.bridgeConfig.save_config(backup=False, resource="scenes", blocking=True)
+            newObject.publish_event("add")
         elif resource == "smart_scene":
             new_object_id = nextFreeId(bridgeConfig, "smart_scene")
             objCreation = {
@@ -648,6 +643,7 @@ class ClipV2ResourceId(Resource):
         elif resource == "light_level":
             return {"errors": [], "data": [object.getLightlevel()]}
 
+    @serialize_scene_writes
     def put(self, resource, resourceid):
         authorisation = authorizeV2(request.headers)
         if "user" not in authorisation:
@@ -695,56 +691,12 @@ class ClipV2ResourceId(Resource):
                         proc.kill()
                     object.update_attr({"stream": {"active": False}})
         elif resource == "scene":
-            # Existing scenes are edited through the V2 "actions" list.
-            # Previously this was handled when creating a scene but ignored
-            # on PUT, so edits made in the Hue app did not update lightstates.
+            if not object:
+                return {"data": [], "errors": [{"description": "Scene not found"}]}, 404
             if "actions" in putDict:
-                lightstates = weakref.WeakKeyDictionary()
-
-                for action in putDict["actions"]:
-                    target = action.get("target", {})
-
-                    if target.get("rtype") != "light":
-                        continue
-
-                    lightObj = getObject(
-                        "light",
-                        target.get("rid")
-                    )
-
-                    if not lightObj:
-                        continue
-
-                    scene = action.get("action", {})
-                    sceneState = {}
-
-                    if "on" in scene:
-                        sceneState["on"] = scene["on"]["on"]
-
-                    if "dimming" in scene:
-                        sceneState["bri"] = int(
-                            scene["dimming"]["brightness"] * 2.54
-                        )
-
-                    if "color" in scene:
-                        if "xy" in scene["color"]:
-                            sceneState["xy"] = [
-                                scene["color"]["xy"]["x"],
-                                scene["color"]["xy"]["y"]
-                            ]
-
-                    if "color_temperature" in scene:
-                        if "mirek" in scene["color_temperature"]:
-                            sceneState["ct"] = (
-                                scene["color_temperature"]["mirek"]
-                            )
-
-                    if "gradient" in scene:
-                        sceneState["gradient"] = scene["gradient"]
-
-                    lightstates[lightObj] = sceneState
-
-                object.lightstates = lightstates
+                object.lightstates = scene_actions(putDict["actions"])
+                if not object.group:
+                    object.lights = [weakref.ref(light) for light in object.lightstates]
 
             # Hue scene speed is 0.0..1.0. Apply it BEFORE recall
             # and propagate changes to an already running dynamic scene.
@@ -773,18 +725,24 @@ class ClipV2ResourceId(Resource):
                 except (TypeError, ValueError):
                     pass
 
-            if "recall" in putDict:
-                object.activate(putDict)
-                # Recalling a scene stops a smart scene running on its group
-                if object.group is not None and object.group() is not None:
-                    stopSmartScenesOn(object.group())
-
             if "palette" in putDict:
                 object.palette = putDict["palette"]
             if "metadata" in putDict:
-                object.name = putDict["metadata"]["name"]
-            if any(key in putDict for key in ("metadata", "speed", "palette", "actions")):
+                metadata = putDict["metadata"]
+                if "name" in metadata:
+                    object.name = metadata["name"]
+                if "image" in metadata:
+                    object.image = (metadata["image"] or {}).get("rid")
+            if "recall" in putDict:
+                object.activate(putDict)
+                if object.group is not None and object.group() is not None:
+                    stopSmartScenesOn(object.group())
+            edited = any(key in putDict for key in ("metadata", "speed", "palette", "actions"))
+            if edited:
+                object.lastupdated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
                 configManager.bridgeConfig.save_config(backup=False, resource="scenes", blocking=True)
+            if edited or "recall" in putDict:
+                object.publish_event("update")
         elif resource == "smart_scene":
             if "recall" in putDict and "action" in putDict["recall"]:
                 object.activate(putDict)
@@ -903,13 +861,14 @@ class ClipV2ResourceId(Resource):
                 }]
             }, 500
 
-        response = {"data": [{
+        response = {"errors": [], "data": [{
             "rid": resourceid,
             "rtype": resource
         }]}
 
         return response
 
+    @serialize_scene_writes
     def delete(self, resource, resourceid):
         # logging.debug(request.headers)
         authorisation = authorizeV2(request.headers)
@@ -917,7 +876,13 @@ class ClipV2ResourceId(Resource):
             return "", 403
         object = getObject(resource, resourceid)
 
-        if hasattr(object, 'getObjectPath'):
+        if resource == "scene":
+            if not object:
+                return {"data": [], "errors": [{"description": "Scene not found"}]}, 404
+            Scene.remove_scene(bridgeConfig["scenes"], object.id_v1)
+            configManager.bridgeConfig.mark_dirty("scenes")
+            configManager.bridgeConfig.save_config(backup=False, resource="scenes", blocking=True)
+        elif hasattr(object, 'getObjectPath'):
             # getObjectPath returns V1 resource names (e.g. "lights", "groups")
             # which map directly to CONFIG_FILES keys
             v1_resource = object.getObjectPath()["resource"]
@@ -934,10 +899,8 @@ class ClipV2ResourceId(Resource):
         # survive a bridge restart (scenes, behavior instances).
         if resource == "behavior_instance":
             configManager.bridgeConfig.save_config(backup=False, resource="behavior_instance")
-        elif resource == "scene":
-            configManager.bridgeConfig.save_config(backup=False, resource="scenes")
 
-        response = {"data": [{
+        response = {"errors": [], "data": [{
             "rid": resourceid,
             "rtype": resource
         }]}

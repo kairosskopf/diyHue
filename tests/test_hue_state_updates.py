@@ -1,5 +1,6 @@
 """Exercise Hue notifications and HA recovery through the runtime entry points."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import unittest
 from types import SimpleNamespace
@@ -81,6 +82,66 @@ class HueStateUpdates(unittest.TestCase):
         apply_report(self.second, {"bri": 127}, self.bridge["groups"])
         self.assertEqual(self.brightness_events(cursor),
                          {self.second.id_v2: 50, self.room.id_v2: 50})
+
+    def test_ha_report_during_command_wins_even_if_brightness_was_unchanged(self):
+        for original in (26, 255):
+            initial = row("on", 1)
+            initial["attributes"]["brightness"] = original
+            ha.update_mapped_light(self.first, initial, self.bridge)
+            report = row("on", 2)
+            report["attributes"]["brightness"] = 255
+            cursor = event_sequence()
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                def confirm(*args):
+                    event = {"event": {"data": {"entity_id": "light.test1", "new_state": report}}}
+                    worker.submit(self.client.do_state_changed, event).result(timeout=2)
+                with patch("lights.protocols.homeassistant_ws.set_light", side_effect=confirm):
+                    self.first.setV2State({"dimming": {"brightness": 20}})
+            self.assertEqual(self.first.state["bri"], 254)
+            self.assertEqual(self.brightness_events(cursor)[self.first.id_v2], 100)
+
+    def test_failed_single_mqtt_write_preserves_last_reported_room_and_lamp(self):
+        self.second.protocol = "mqtt"
+        self.second.state.update(on=True, bri=127)
+        with patch("lights.protocols.mqtt.set_light", side_effect=ConnectionError):
+            self.assertIs(self.second.setV2State({"dimming": {"brightness": 10}}), False)
+        self.assertEqual(self.second.state["bri"], 127)
+        self.assertEqual(self.room.getV2GroupedLight()["dimming"]["brightness"], 50)
+
+    def test_partial_report_keeps_unreported_command_fields_and_survives_send_failure(self):
+        self.second.protocol = "mqtt"
+        self.second.state.update(on=False, bri=127)
+        def report_during_send(*args):
+            apply_report(self.second, {"bri": 254}, self.bridge["groups"])
+        with patch("lights.protocols.mqtt.set_light", side_effect=report_during_send):
+            self.second.setV1State({"on": True, "bri": 25})
+        self.assertIs(self.second.state["on"], True)
+        self.assertEqual(self.second.state["bri"], 254)
+        def report_then_fail(*args):
+            apply_report(self.second, {"bri": 50}, self.bridge["groups"])
+            raise ConnectionError()
+        with patch("lights.protocols.mqtt.set_light", side_effect=report_then_fail):
+            self.assertIs(self.second.setV1State({"bri": 100}), False)
+        self.assertEqual(self.second.state["bri"], 50)
+        self.assertFalse(self.second.pending_fields)
+
+    def test_v2_relative_dimming_for_lamp_and_room(self):
+        self.first.state.update(on=True, bri=127)
+        self.second.state.update(on=True, bri=200)
+        self.second.protocol_cfg["max_bri"] = 210
+        increase = {"dimming_delta": {"action": "up", "brightness_delta": 10}}
+        with patch("lights.protocols.homeassistant_ws.set_light"):
+            cursor = event_sequence()
+            self.first.setV2State(increase)
+            self.assertEqual(self.first.state["bri"], 152)
+            self.assertEqual(self.brightness_events(cursor)[self.first.id_v2], round(152/2.54, 2))
+            cursor = event_sequence()
+            self.room.setV2Action(increase)
+            self.assertEqual([self.first.state["bri"], self.second.state["bri"]], [177, 210])
+            self.assertEqual(self.brightness_events(cursor)[self.room.id_v2],
+                             self.room.getV2GroupedLight()["dimming"]["brightness"])
+            self.room.setV2Action({"dimming_delta": {"action": "down", "brightness_delta": 100}})
+            self.assertEqual([self.first.state["bri"], self.second.state["bri"]], [1, 1])
 
     def test_group_brightness_limit_is_per_lamp(self):
         self.first.protocol_cfg["max_bri"] = 127

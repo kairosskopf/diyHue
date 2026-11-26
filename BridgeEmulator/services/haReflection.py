@@ -139,7 +139,7 @@ class Reflector:
                 if entity in self.tombstones:
                     self.apply_state(light, {"reachable": False})
                 else:
-                    self.apply_state(light, translate(light.state, row))
+                    self.apply_state(light, translate({}, row))
 
     def event(self, epoch, entity, row):
         with self.lock:

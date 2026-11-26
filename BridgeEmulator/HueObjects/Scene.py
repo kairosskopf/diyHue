@@ -2,6 +2,7 @@ import uuid
 import logManager
 import weakref
 from threading import Thread
+from flaskUI import scene_write_lock
 from datetime import datetime, timezone
 from HueObjects import genV2Uuid, StreamEvent, set_light_actions, brightness_percent
 
@@ -41,6 +42,7 @@ class Scene():
         self.speed = data["speed"] if "speed" in data else self.DEFAULT_SPEED
         self.group = data["group"] if "group" in data else None
         self.lights = data["lights"] if "lights" in data else []
+        self._palette_run = None
         self.status = data["status"] if "status" in data else "inactive"
         if "group" in data:
             self.lights = self.group().lights
@@ -53,56 +55,72 @@ class Scene():
     def add_light(self, light):
         self.lights.append(light)
 
-    def activate(self, data):
-        # activate dynamic scene
-        if "recall" in data:
-            if data["recall"]["action"] == "dynamic_palette":
-                self.status = data["recall"]["action"]
-                lightIndex = 0
-                for light in self.lights:
-                    if not light():
-                        continue
+    def _stop_palette(self):
+        if self._palette_run is not None:
+            for light in list(self.lightstates):
+                if light.palette_run is self._palette_run:
+                    light.palette_run = None
+                    light.dynamics["status"] = "none"
+            self._palette_run = None
 
-                    lightObj = light()
-                    sceneState = self.lightstates.get(lightObj)
-
-                    # GroupScene.lights contains every light in the room.
-                    # Only lights represented by the saved scene actions
-                    # should participate in dynamic playback.
-                    if sceneState is None:
-                        continue
-
-                    # Hue stores lights disabled in the scene as on:false.
-                    # Keep those lights off instead of starting a dynamic
-                    # scene worker for them.
-                    if sceneState.get("on") is False:
-                        lightObj.setV1State({"on": False})
-                        continue
-
-                    if not lightObj.state.get("on") and lightObj.setV1State({"on": True}) is False:
-                        continue
-                    lightObj.dynamics["speed"] = self.speed
-                    Thread(
-                        target=lightObj.dynamicScenePlay,
-                        args=[self.palette, lightIndex]
-                    ).start()
-                    lightIndex += 1
-                return
-            elif data["recall"]["action"] == "deactivate":
+    def activate(self, data, *, group=None):
+        import configManager
+        with scene_write_lock:
+            scenes = configManager.bridgeConfig.yaml_config.get("scenes", {})
+            action = data.get("recall", {}).get("action", "active")
+            targets = dict(self.lightstates.items())
+            if group is not None:  # v1 recalls are restricted to the addressed group
+                members = {ref() for ref in group.lights}
+                targets = {light: state for light, state in targets.items() if light in members}
+            if action == "deactivate":
+                self._stop_palette()
                 self.status = "inactive"
+                self.publish_event("update")
                 return
+            if action == "dynamic_palette":
+                self._stop_palette()
+                applied = self._start_palette(targets)
+            else:
+                applied = self._recall_static(data, targets, group)
+                if applied:
+                    self._stop_palette()
+            for previous in list(scenes.values()):
+                if previous is self or previous.status == "inactive":
+                    continue
+                if not applied.isdisjoint(previous.lightstates):
+                    previous._stop_palette()
+                    previous.status = "inactive"
+                    previous.publish_event("update")
+            if applied:
+                self.status = action if applied == targets.keys() else "inactive"
+            self.publish_event("update")
+            return len(applied) == len(targets)
 
+    def _start_palette(self, targets):
+        self._palette_run = object()
+        applied = set()
+        index = 0
+        for ref in self.lights:
+            light = ref()
+            if light not in targets:
+                continue
+            if targets[light].get("on") is False:
+                if light.setV1State({"on": False}) is not False:
+                    applied.add(light)
+                continue
+            if not light.state.get("on") and light.setV1State({"on": True}) is False:
+                continue
+            light.dynamics["speed"] = self.speed
+            light.palette_run = self._palette_run
+            Thread(target=light.dynamicScenePlay, args=(self.palette, index, self._palette_run)).start()
+            applied.add(light)
+            index += 1
+        return applied
+
+    def _recall_static(self, data, targets, group):
         actions = []
-        # "recall" is only present when the scene is triggered via the v2 REST API
-        # (PUT /clip/v2/resource/scene with a recall action).  Internal callers such
-        # as behavior_instance automation pass a plain transition dict instead, so we
-        # fall back to "active" when the key is absent.
-        self.status = data["recall"]["action"] if "recall" in data else "active"
-        for light, saved_state in self.lightstates.items():
+        for light, saved_state in targets.items():
             state = saved_state.copy()
-            if light.dynamics["status"] == "dynamic_palette":
-                light.dynamics["status"] = "none"
-                logging.debug("Stop Dynamic scene play for " + light.name)
             if len(data) > 0:
                 transitiontime = 0
                 if "seconds" in data:
@@ -116,10 +134,17 @@ class Scene():
                         data["recall"]["duration"] / 100)
 
             actions.append((light, state))
-        set_light_actions(actions)
-
-        if self.type == "GroupScene":
+        applied = set_light_actions(actions, group=group)
+        for light in applied:
+            if light.dynamics["status"] == "dynamic_palette":
+                light.palette_run = None
+                light.dynamics["status"] = "none"
+        if group is not None:
+            group.state = group.update_state()
+            group.genStreamEvent({"dimming": {}})
+        elif self.type == "GroupScene":
             self.group().state = self.group().update_state()
+        return applied
 
     def getV1Api(self):
         result = {}

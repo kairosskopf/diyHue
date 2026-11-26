@@ -130,6 +130,25 @@ def v2StateToV1(v2State):
         v1State["transitiontime"] = v2State["transitiontime"]
     return v1State
 
+def resolve_dimming_delta(light, command, delta):
+    """Resolve a v2 step against this lamp, preserving differences within a room."""
+    state = command.copy()
+    if "bri" in state or "bri" not in light.state or not state.get("on", light.state["on"]):
+        return state
+    level = light.state["bri"]
+    if not isinstance(level, (int, float)):
+        return state
+    action = delta.get("action")
+    if action == "stop":
+        state.update(bri=max(1, min(254, level)), transitiontime=0)
+    elif action in ("up", "down"):
+        magnitude = delta.get("brightness_delta", 100)
+        if isinstance(magnitude, (int, float)) and 0 < magnitude <= 100:
+            step = round(magnitude * 2.54)
+            state["bri"] = max(1, min(254, level + (step if action == "up" else -step)))
+    return state
+
+
 def genV2Uuid():
     return str(uuid.uuid4())
 
@@ -163,30 +182,17 @@ def limit_brightness(state, config):
 
 def send_light_batch(batch, changed):
     sender = next(iter(batch.values()))[0]
-    payload = {}
-    staged = {}
-    for address, (light, state) in batch.items():
-        # An echo can arrive during the network write. Stage first so that a
-        # correction from the device wins and is included in the final event.
-        old = {key: light.state[key] for key in state if key in light.state}
-        if "colormode" in light.state:
-            old["colormode"] = light.state["colormode"]
-        light.state.update({key: state[key] for key in state if key in light.state})
-        light.updateLightState(state)
-        staged[light] = {key: (value, light.state[key]) for key, value in old.items()}
-        payload[address] = state
-
-    command = {"lights": payload}
+    command = {"lights": {address: state for address, (_, state) in batch.items()}}
     if sender.protocol == "mqtt":
         command["members"] = {address: light for address, (light, _) in batch.items()}
-    sent = sender.setV1State(command) is not False
+    tickets = {light: light.begin_write(state) for light, state in batch.values()}
+    sent = False
+    try:
+        sent = sender.send_protocol_command(command)
+    finally:
+        for light, state in batch.values():
+            light.finish_write(state, tickets[light], sent)
     for light, state in batch.values():
-        if not sent:
-            for key, (old, requested) in staged[light].items():
-                if light.state[key] == requested:
-                    light.state[key] = old
-        elif state.get("on") is False:
-            light.dynamics["status"] = "none"
         fields = v1StateToV2(state)
         if not sent:
             current = light.getV2Api()
@@ -194,17 +200,20 @@ def send_light_batch(batch, changed):
         light.genStreamEvent(fields, groups={})
         if "bri" in state or "on" in state:
             changed.add(light)
+    return sent
 
 
 def set_light_actions(actions, *, group=None):
     """Dispatch per-lamp states, retaining one network write per batch-capable device."""
     batches = {}
     changed = set()
+    applied = set()
     try:
         for light, state in actions:
             state = state.copy()
             if light.protocol not in ("native_multi", "mqtt"):
-                light.setV1State(state, group_changes=changed)
+                if light.setV1State(state, group_changes=changed) is not False:
+                    applied.add(light)
                 continue
 
             # A brightness-only group command must not wake an off MQTT light.
@@ -218,54 +227,54 @@ def set_light_actions(actions, *, group=None):
             batch[address] = (light, state)
 
         for batch in batches.values():
-            send_light_batch(batch, changed)
+            if send_light_batch(batch, changed):
+                applied.update(light for light, _ in batch.values())
     finally:
         publish_group_brightness(changed, exclude=group)
+    return applied
 
 
-def setGroupAction(group, state, scene=None):
+def setGroupAction(group, state, scene=None, *, dimming_delta=None):
+    if scene is not None:
+        scene.activate({}, group=group)
+        return
     lightsState = {}
-    if scene != None:
-        sceneStates = list(scene.lightstates.items())
-        for light, state in sceneStates:
-            lightsState[light.id_v1] = state
-            if "on" in state and state["on"] == True:
-                group.state["any_on"] = True
-
-    else:
-        if "bri_inc" in state:
-            members = (ref() for ref in group.lights)
-            levels = [light.state["bri"] for light in members if light is not None
-                      and light.state.get("on") and isinstance(light.state.get("bri"), (int, float))]
-            if levels:
-                group.action["bri"] = round(sum(levels) / len(levels))
-        state = incProcess(group.action, state)
-        for light in group.lights:
-            if light():
-                # Group 0 means "all lights". Sockets report as Hue on/off
-                # plug-in units (model ids LOM001/LOM004/...); switching them
-                # with the lights would cut power to whatever is plugged in.
-                if group.id_v1 == "0" and (light().config.get("archetype") == "plug" or str(light().modelid).startswith("LOM")):
+    if "bri_inc" in state:
+        members = (ref() for ref in group.lights)
+        levels = [light.state["bri"] for light in members if light is not None
+                  and light.state.get("on") and isinstance(light.state.get("bri"), (int, float))]
+        if levels:
+            group.action["bri"] = round(sum(levels) / len(levels))
+    state = incProcess(group.action, state)
+    for light in group.lights:
+        if light():
+            # Group 0 means "all lights". Sockets report as Hue on/off
+            # plug-in units (model ids LOM001/LOM004/...); switching them
+            # with the lights would cut power to whatever is plugged in.
+            if group.id_v1 == "0" and (light().config.get("archetype") == "plug" or str(light().modelid).startswith("LOM")):
+                continue
+            member_state = state
+            if dimming_delta is not None:
+                member_state = resolve_dimming_delta(light(), state, dimming_delta)
+                if not member_state.keys() - {"transitiontime"}:
                     continue
-                lightsState[light().id_v1] = state
-        if "xy" in state:
-            group.action["colormode"] = "xy"
-        elif "ct" in state:
-            group.action["colormode"] = "ct"
-        elif "hue" in state or "sat" in state:
-            group.action["colormode"] = "hs"
+            lightsState[light().id_v1] = member_state
+    if "xy" in state:
+        group.action["colormode"] = "xy"
+    elif "ct" in state:
+        group.action["colormode"] = "ct"
+    elif "hue" in state or "sat" in state:
+        group.action["colormode"] = "hs"
 
-        if "on" in state:
-            group.state["any_on"] = state["on"]
-            group.state["all_on"] = state["on"]
-        group.action.update(state)
+    if "on" in state:
+        group.state["any_on"] = state["on"]
+        group.state["all_on"] = state["on"]
+    group.action.update(state)
 
     members = (ref() for ref in group.lights)
     actions = [(light, lightsState[light.id_v1]) for light in members
                if light is not None and light.id_v1 in lightsState]
     set_light_actions(actions, group=group)
-    if scene is not None:
-        group.genStreamEvent({"dimming": {}})
 
     group.state = group.update_state()
 

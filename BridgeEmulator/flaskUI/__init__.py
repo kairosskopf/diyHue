@@ -3,7 +3,7 @@ from inspect import signature
 from threading import RLock
 
 
-_scene_write_lock = RLock()
+scene_write_lock = RLock()
 
 
 def serialize_scene_writes(handler):
@@ -14,7 +14,7 @@ def serialize_scene_writes(handler):
     def dispatch(*args, **kwargs):
         resource = kwargs["resource"] if "resource" in kwargs else args[resource_index]
         if resource in ("scene", "scenes", "smart_scene"):
-            with _scene_write_lock:
+            with scene_write_lock:
                 return handler(*args, **kwargs)
         return handler(*args, **kwargs)
 

@@ -152,7 +152,7 @@ class Group():
 
     def setV2Action(self, state):
         v1State = v2StateToV1(state)
-        setGroupAction(self, v1State)
+        setGroupAction(self, v1State, dimming_delta=state.get("dimming_delta"))
         self.genStreamEvent(state)
 
     def setV1Action(self, state, scene=None):
@@ -169,6 +169,8 @@ class Group():
 
     def genStreamEvent(self, v2State):
         v2State = dict(v2State)
+        if v2State.pop("dimming_delta", None) is not None:
+            v2State["dimming"] = {}
         if "on" in v2State or "dimming" in v2State:
             summary = self.update_state(exact_brightness=True)
             v2State["on"] = {"on": summary["any_on"]}

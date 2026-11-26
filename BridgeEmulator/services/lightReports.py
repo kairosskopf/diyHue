@@ -6,6 +6,13 @@ from uuid import uuid4
 
 
 def apply_report(light, report, groups):
+    with light.state_lock:
+        for key in report:
+            light.pending_fields.pop(key, None)
+        _apply_report(light, report, groups)
+
+
+def _apply_report(light, report, groups):
     if all(light.state.get(key) == value for key, value in report.items()) and not (
             report.get("on") is False and light.dynamics["status"] == "dynamic_palette"):
         return

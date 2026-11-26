@@ -289,7 +289,7 @@ class EntertainmentConfiguration():
 
     def setV2Action(self, state):
         v1State = v2StateToV1(state)
-        setGroupAction(self, v1State)
+        setGroupAction(self, v1State, dimming_delta=state.get("dimming_delta"))
         self.genStreamEvent(state)
 
     def setV1Action(self, state, scene=None):

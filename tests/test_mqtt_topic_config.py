@@ -100,6 +100,45 @@ class MqttBaseTopicTests(unittest.TestCase):
         ])
         self.assertIn("office dimmer", self.sensor_names())
 
+    def test_nested_device_and_base_topics_deliver_state_but_ignore_commands(self):
+        from paho.mqtt.client import topic_matches_sub
+        from HueObjects.Light import Light
+        for base in ("zigbee2mqtt", "home/z2m"):
+            for friendly in ("lamp", "office/lamp"):
+                with self.subTest(base=base, friendly=friendly), patch.object(mqtt, "devices_ids", {}):
+                    topic = base + "/" + friendly
+                    light = Light({"id_v1": "1", "modelid": "LCT015", "name": friendly,
+                                   "protocol": "mqtt", "protocol_cfg": {"state_topic": topic}})
+                    self.config["config"]["mqtt"]["baseTopic"] = base
+                    self.config["lights"]["1"] = light
+                    client = Mock()
+                    mqtt.on_connect(client, None, None, 0)
+                    topics = [c.args[0] for c in client.subscribe.call_args_list]
+                    self.assertTrue(any(topic_matches_sub(t, topic) for t in topics))
+                    self.discover(topic, {"state": "ON", "brightness": 254})
+                    self.discover(topic + "/set", {"brightness": 10})
+                    self.assertEqual(light.state["bri"], 254)
+
+    def test_discovery_subscribes_to_a_renamed_nested_topic_before_reconnect(self):
+        from HueObjects.Light import Light
+        broker = Mock()
+        old = "zigbee2mqtt/old/desk"
+        new = "zigbee2mqtt/office/desk"
+        light = Light({"id_v1": "1", "modelid": "LCT015", "name": "desk", "protocol": "mqtt",
+                       "protocol_cfg": {"uid": "desk-1", "state_topic": old}})
+        self.config["lights"]["1"] = light
+        data = {"unique_id": "desk-1", "state_topic": new, "command_topic": new + "/set"}
+        msg = SimpleNamespace(topic="homeassistant/light/desk/light/config", payload=json.dumps(data).encode())
+        with patch.object(mqtt, "devices_ids", {}), patch.object(mqtt, "discoveredDevices", {}):
+            mqtt.on_connect(broker, None, None, 0)
+            self.discover(old, {"brightness": 25})
+            mqtt.on_message(broker, None, msg)
+            broker.unsubscribe.assert_called_with(old)
+            broker.subscribe.assert_any_call(new)
+            self.discover(new, {"brightness": 254})
+            self.discover(old, {"brightness": 25})
+            self.assertEqual(light.state["bri"], 254)
+
     def test_light_discovery_publishes_to_configured_base_topic(self):
         from lights.protocols import mqtt as light_mqtt
         mqtt_config = {

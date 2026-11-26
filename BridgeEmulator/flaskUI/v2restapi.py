@@ -734,15 +734,16 @@ class ClipV2ResourceId(Resource):
                     object.name = metadata["name"]
                 if "image" in metadata:
                     object.image = (metadata["image"] or {}).get("rid")
-            if "recall" in putDict:
-                object.activate(putDict)
-                if object.group is not None and object.group() is not None:
-                    stopSmartScenesOn(object.group())
             edited = any(key in putDict for key in ("metadata", "speed", "palette", "actions"))
             if edited:
                 object.lastupdated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
                 configManager.bridgeConfig.save_config(backup=False, resource="scenes", blocking=True)
-            if edited or "recall" in putDict:
+            if "recall" in putDict:
+                if object.activate(putDict) is False:
+                    return {"errors": [{"description": "Scene could not be applied to all target lights"}], "data": []}, 503
+                if object.group is not None and object.group() is not None:
+                    stopSmartScenesOn(object.group())
+            elif edited:
                 object.publish_event("update")
         elif resource == "smart_scene":
             if not object:

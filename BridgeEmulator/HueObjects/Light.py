@@ -1,11 +1,13 @@
 import uuid
 import logManager
+from flaskUI import scene_write_lock
 from lights.light_types import lightTypes, archetype
 from lights.protocols import protocols, wled
-from HueObjects import genV2Uuid, incProcess, v1StateToV2, generate_unique_id, v2StateToV1, StreamEvent, limit_brightness, publish_group_brightness, brightness_percent
+from HueObjects import resolve_dimming_delta, genV2Uuid, incProcess, v1StateToV2, generate_unique_id, v2StateToV1, StreamEvent, limit_brightness, publish_group_brightness, brightness_percent
 from datetime import datetime, timezone
 from copy import deepcopy
 from time import sleep
+from threading import RLock
 
 logging = logManager.logger.get_logger(__name__)
 
@@ -25,6 +27,9 @@ class Light():
         self.config = deepcopy(data["config"]) if "config" in data else deepcopy(
             lightTypes[self.modelid]["config"])
         self.protocol_cfg = data["protocol_cfg"] if "protocol_cfg" in data else {}
+        self.state_lock = RLock()
+        self.pending_fields = {}
+        self.palette_run = None
         self.streaming = False
         self.dynamics = deepcopy(lightTypes[self.modelid]["dynamics"])
         self.effect = "no_effect"
@@ -166,49 +171,78 @@ class Light():
                     return self._setV1State(state, advertise, group_changes)
         return self._setV1State(state, advertise, group_changes)
 
-    def _setV1State(self, state, advertise, group_changes):
-        if "lights" not in state:
-            state = incProcess(self.state.copy(), state)
-            limit_brightness(state, self.protocol_cfg)
-            if self.protocol == "homeassistant_ws":
-                from lights.protocols import homeassistant_ws
-                from services.homeAssistantWS import MappingUnavailable
+    def _cache_command(self, state, *, update_mode=True):
+        if state.get("on") is False:
+            self.dynamics["status"] = "none"
+        if update_mode:
+            self.updateLightState(state)
+        for key, value in state.items():
+            if key in self.state:
+                self.state[key] = value
+            if key in self.config:
+                self.config[key] = value.replace("_", "") if key == "archetype" else value
+            if key == "name":
+                self.name = value
+            if key == "function":
+                self.function = value
+
+    def begin_write(self, state):
+        # A device can report a value even before the transport returns. A
+        # report (including an unchanged one) takes ownership of that field.
+        ticket = object()
+        with self.state_lock:
+            keys = (state.keys() & self.state.keys()) | {"reachable"}
+            if state.keys() & {"xy", "ct", "hue", "sat"}:
+                keys.add("colormode")
+            self.pending_fields.update(dict.fromkeys(keys, ticket))
+        return ticket
+
+    def finish_write(self, state, ticket, success):
+        with self.state_lock:
+            owned = {k for k, owner in self.pending_fields.items() if owner is ticket}
+            for key in owned:
+                del self.pending_fields[key]
+            if "reachable" in owned:
+                self.state["reachable"] = success
+            if success:
+                accepted = {k: v for k, v in state.items() if k not in self.state or k in owned}
+                self._cache_command(accepted, update_mode="colormode" in owned)
+
+    def send_protocol_command(self, state):
+        from services.homeAssistantWS import MappingUnavailable
+        for adapter in protocols:
+            if adapter.__name__ == "lights.protocols." + self.protocol:
                 try:
-                    homeassistant_ws.set_light(self, state)
+                    adapter.set_light(self, state)
                 except MappingUnavailable:
                     raise
                 except Exception as error:
-                    self.state["reachable"] = False
                     logging.warning("%s light error: %s", self.name, error)
                     return False
-                self.state["reachable"] = True
-            if state.get("on") is False:
-                self.dynamics["status"] = "none"
-            self.updateLightState(state)
-            for key, value in state.items():
-                if key in self.state:
-                    self.state[key] = value
-                if key in self.config:
-                    if key == "archetype":
-                        self.config[key] = value.replace("_","")
-                    else:
-                        self.config[key] = value
-                if key == "name":
-                    self.name = value
-                if key == "function":
-                    self.function = value
-        if self.protocol not in ("dummy", "homeassistant_ws"):
-            for protocol in protocols:
-                if "lights.protocols." + self.protocol == protocol.__name__:
-                    try:
-                        protocol.set_light(self, state)
-                        self.state["reachable"] = True
-                    except Exception as e:
-                        self.state["reachable"] = False
-                        logging.warning(self.name + " light error, details: %s", e)
-                        return False
-                    break
-        if advertise and "lights" not in state:
+                break
+        return True
+
+    def _setV1State(self, state, advertise, group_changes):
+        if "lights" in state:
+            return self.send_protocol_command(state)
+        state = incProcess(self.state.copy(), state)
+        limit_brightness(state, self.protocol_cfg)
+        if self.protocol in ("mqtt", "homeassistant_ws"):
+            ticket = self.begin_write(state)
+            sent = False
+            try:
+                sent = self.send_protocol_command(state)
+            finally:
+                self.finish_write(state, ticket, sent)
+            if not sent:
+                return False
+        else:
+            self._cache_command(state)
+            if self.protocol != "dummy":
+                self.state["reachable"] = self.send_protocol_command(state)
+                if not self.state["reachable"]:
+                    return False
+        if advertise:
             v2State = v1StateToV2(state)
             self.genStreamEvent(v2State, groups=None if group_changes is None else {})
             if group_changes is not None and ("on" in state or "bri" in state):
@@ -231,11 +265,22 @@ class Light():
                 v1State["name"] = state["metadata"]["name"]
             if "function" in state["metadata"]:
                 v1State["function"] = state["metadata"]["function"]
+        if "dimming_delta" in state:
+            state = state.copy()
+            v1State = resolve_dimming_delta(self, v1State, state.pop("dimming_delta"))
+            if "bri" in v1State:
+                state["dimming"] = {}
+            elif not v1State.keys() - {"transitiontime"}:
+                return
         if self.setV1State(v1State, advertise=False) is False:
             return False
         self.genStreamEvent(state)
 
     def genStreamEvent(self, v2State, groups=None):
+        with self.state_lock:
+            self._publish_state(v2State, groups)
+
+    def _publish_state(self, v2State, groups):
         # Commands may be quantized, limited per lamp, or corrected by a device
         # report. Publish the same brightness and power that a subsequent GET sees.
         if "on" in v2State or "dimming" in v2State:
@@ -509,12 +554,16 @@ class Light():
     def getObjectPath(self):
         return {"resource": "lights", "id": self.id_v1}
 
-    def dynamicScenePlay(self, palette, index):
+    def dynamicScenePlay(self, palette, index, run=None):
         logging.debug("Start Dynamic scene play for " + self.name)
-        if "dynamic_palette" in self.dynamics["status_values"]:
-            self.dynamics["status"] = "dynamic_palette"
+        with scene_write_lock:
+            if self.palette_run is not run:
+                return
+            if "dynamic_palette" in self.dynamics["status_values"]:
+                self.dynamics["status"] = "dynamic_palette"
         while (
-            self.dynamics["status"] == "dynamic_palette"
+            self.palette_run is run
+            and self.dynamics["status"] == "dynamic_palette"
             and self.state.get("on", True)
         ):
             try:
@@ -546,24 +595,24 @@ class Light():
                         gradientIndex += 1
                         if gradientIndex == len(palette["color"]):
                             gradientIndex = 0
-                    self.setV2State(
-                        {"gradient": {"points": points}, "transitiontime": transition})
+                    lightState = {"gradient": {"points": points}, "transitiontime": transition}
                 else:
                     lightState = deepcopy(palette["color"][index])
                     # based on youtube videos, the transition is slow
                     lightState["transitiontime"] = transition
-                    self.setV2State(lightState)
             elif self.modelid == "LTW001":
                 if index >= len(palette["color_temperature"]):
                     index = 0
                 lightState = deepcopy(palette["color_temperature"][index])
                 lightState["transitiontime"] = transition
-                self.setV2State(lightState)
             else:
                 if index >= len(palette["dimming"]):
                     index = 0
                 lightState = deepcopy(palette["dimming"][index])
                 lightState["transitiontime"] = transition
+            with scene_write_lock:
+                if self.palette_run is not run or self.dynamics["status"] != "dynamic_palette":
+                    return
                 self.setV2State(lightState)
             # Wait in short slices instead of one long sleep.
             # This lets Hue speed changes and OFF commands take effect
@@ -572,6 +621,7 @@ class Light():
 
             while (
                 remaining > 0
+                and self.palette_run is run
                 and self.dynamics["status"] == "dynamic_palette"
                 and self.state.get("on", True)
             ):
@@ -591,6 +641,8 @@ class Light():
                 sleep(chunk)
                 remaining -= chunk
 
+            if self.palette_run is not run:
+                return
             # OFF or scene deactivation means the worker is finished.
             if (
                 self.dynamics["status"] != "dynamic_palette"

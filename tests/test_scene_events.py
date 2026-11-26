@@ -31,6 +31,7 @@ class SceneEvents(unittest.TestCase):
         config = {"apiUsers": {"key": SimpleNamespace(username="key")}, "scenes": {}, "smart_scene": {},
                   "lights": {l.id_v1: l for l in self.lights}, "groups": {"1": self.room}, "sensors": {}}
         store = SimpleNamespace(bridgeConfig=SimpleNamespace(yaml_config=config, mark_dirty=Mock(), save_config=Mock()))
+        self.enterContext(patch.dict(sys.modules, {"configManager": store}))
         self.users = config["apiUsers"]
         self.smart_scenes = config["smart_scene"]
         self.scenes = config["scenes"]
@@ -162,6 +163,40 @@ class SceneEvents(unittest.TestCase):
         del held
         gc.collect()
         self.assertFalse(any(r.get("id") == rid for _, event in events_after(cursor, 0) for r in event["data"]))
+
+    def test_recalling_a_conflicting_scene_deactivates_and_announces_the_previous_one(self):
+        a = self.create()
+        self.payload["actions"][0]["action"]["dimming"] = {"brightness": 90}
+        b = self.create()
+        for path in (a, b):
+            cursor = event_sequence()
+            response = self.client.put(path, json={"recall": {"action": "active"}})
+            self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.client.get(a).json["data"][0]["status"]["active"], "inactive")
+        self.assertEqual(self.client.get(b).json["data"][0]["status"]["active"], "active")
+        statuses = [(r["id"], r["status"]["active"]) for _, event in events_after(cursor, 0)
+                    for r in event["data"] if r["type"] == "scene"]
+        self.assertEqual(statuses, [(a.rsplit("/", 1)[1], "inactive"), (b.rsplit("/", 1)[1], "active")])
+
+    def test_failed_scene_recall_preserves_the_previous_scene(self):
+        first = self.create()
+        second = self.create()
+        self.assertEqual(self.client.put(first, json={"recall": {"action": "active"}}).status_code, 200)
+        self.lights[1].protocol = "mqtt"
+        self.lights[1].protocol_cfg.update(ip="broker", command_topic="lights/second/set")
+        with patch("lights.protocols.mqtt.set_light", side_effect=ConnectionError):
+            self.assertEqual(self.client.put(second, json={"recall": {"action": "active"}}).status_code, 503)
+        self.assertEqual(self.client.get(first).json["data"][0]["status"]["active"], "active")
+        self.assertEqual(self.client.get(second).json["data"][0]["status"]["active"], "inactive")
+
+    def test_disjoint_scene_stays_active_after_an_automation_recall(self):
+        first = self.create()
+        self.payload["actions"][0]["target"]["rid"] = self.lights[0].id_v2
+        second = self.create()
+        self.client.put(first, json={"recall": {"action": "active"}})
+        self.scenes["2"].activate({"seconds": 1})
+        for path in (first, second):
+            self.assertEqual(self.client.get(path).json["data"][0]["status"]["active"], "active")
 
     def test_create_streams_only_requested_actions_and_matches_get(self):
         frames = self.subscribe()

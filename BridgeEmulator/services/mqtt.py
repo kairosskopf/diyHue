@@ -23,6 +23,7 @@ bridgeConfig = configManager.bridgeConfig.yaml_config
 client = mqtt.Client()
 
 devices_ids = {}
+_nested_topics = set()
 
 # Configuration stuff
 discoveryPrefix = "homeassistant"
@@ -358,6 +359,8 @@ def on_message(client, userdata, msg):
                 # so the light path turns them into a Hue on/off plug.
                 if lightDiscoveryEnabled():
                     on_autodiscovery_light(msg)
+                    devices_ids.clear()
+                    refresh_nested_topics(client)
             elif msg.topic == getBaseTopic() + "/bridge/devices":
                 for key in data:
                     if "model_id" in key and (key["model_id"] in standardSensors or key["model_id"] in motionSensors): # Sensor is supported
@@ -384,7 +387,7 @@ def on_message(client, userdata, msg):
                                     devices_ids.pop(keeper.name, None)
                                     keeper.name = new_name
                                     keeper.protocol_cfg["friendly_name"] = new_name
-                                    devices_ids[new_name] = keeper
+                                    devices_ids[new_name] = weakref.ref(keeper)
                         elif getObject(key["friendly_name"]) == False: ## Add the new sensor
                             logging.info("MQTT: Add new mqtt sensor " + key["friendly_name"])
                             if key["model_id"] in standardSensors:
@@ -414,6 +417,7 @@ def on_message(client, userdata, msg):
                                     addHueMotionSensor(key["friendly_name"], "mqtt", {"modelid": key["model_id"], "lightSensor": "on", "friendly_name": key["friendly_name"]}, key["model_id"])
                             else:
                                 logging.info("MQTT: unsupported sensor " + key["model_id"])
+                refresh_nested_topics(client)
             elif msg.topic == getBaseTopic() + "/bridge/log":
                 light = getObject(data["meta"]["friendly_name"])
                 if data["type"] == "device_announced":
@@ -426,7 +430,10 @@ def on_message(client, userdata, msg):
                     logging.info(light.name + " is unreachable")
                     light.state["reachable"] = False
             else:
-                device_friendlyname = msg.topic[msg.topic.index("/") + 1:]
+                prefix = getBaseTopic() + "/"
+                if not msg.topic.startswith(prefix):
+                    return
+                device_friendlyname = msg.topic[len(prefix):]
                 device = getObject(device_friendlyname)
                 if device != False:
                     if device.getObjectPath()["resource"] == "sensors":
@@ -540,6 +547,28 @@ def convertHexToMac(hexValue):
     s = ':'.join(s[i:i + 2] for i in range(0, 16, 2))
     return s
 
+def refresh_nested_topics(connection):
+    """Subscribe to exact device topics that the single-level wildcard misses."""
+    if connection is None:
+        return
+    prefix = getBaseTopic() + "/"
+    desired = set()
+    for resource in ("lights", "sensors"):
+        for device in list(bridgeConfig.get(resource, {}).values()):
+            if device.protocol != "mqtt":
+                continue
+            cfg = device.protocol_cfg
+            topic = cfg.get("state_topic") or prefix + cfg.get("friendly_name", "")
+            if topic.startswith(prefix) and "/" in topic[len(prefix):]:
+                desired.add(topic)
+    for topic in desired - _nested_topics:
+        connection.subscribe(topic)
+    for topic in _nested_topics - desired:
+        connection.unsubscribe(topic)
+    _nested_topics.clear()
+    _nested_topics.update(desired)
+
+
 # on_connect handler (linked to client below)
 def on_connect(client, userdata, flags, rc):
     logging.debug("Connected with result code "+str(rc))
@@ -553,6 +582,9 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(baseTopic + "/+")
     client.subscribe(baseTopic + "/bridge/devices")
     client.subscribe(baseTopic + "/bridge/log")
+    _nested_topics.clear()
+    devices_ids.clear()
+    refresh_nested_topics(client)
 
 def mqttServer():
 

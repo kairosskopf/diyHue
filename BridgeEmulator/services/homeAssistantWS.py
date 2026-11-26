@@ -307,7 +307,7 @@ def assert_command_allowed(light):
 def update_mapped_light(light, row, bridge):
     from services.haReflection import translate
     from services.lightReports import apply_report
-    report = translate(light.state, row) if row else {"reachable": False}
+    report = translate({}, row) if row else {"reachable": False}
     apply_report(light, report, bridge.get("groups", {}))
 
 

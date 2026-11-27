@@ -109,6 +109,24 @@ class MqttBaseTopicTests(unittest.TestCase):
         self.assertIn("hue/bridge/log", topics)
         self.assertNotIn("zigbee2mqtt/bridge/devices", topics)
 
+    def test_dimmer_telemetry_does_not_replay_button_release(self):
+        name = "office remote"
+        topic = "zigbee2mqtt/" + name
+        self.discover("zigbee2mqtt/bridge/devices", [
+            device("RWL021", name, "0x0017880100000011"),
+        ])
+        sensor = mqtt.getObject(name)
+        with patch.object(mqtt, "rulesProcessor") as rules, patch.object(mqtt, "checkBehaviorInstances") as behaviors:
+            self.discover(topic, {"action": "on_press_release"})
+            self.assertEqual(sensor.state["buttonevent"], 1002)
+            for payload in ({"battery": 87, "linkquality": 156}, {"action": "unknown"}, {"action": ""}):
+                self.discover(topic, payload)
+            self.assertEqual(sensor.config["battery"], 87)
+            rules.assert_called_once()
+            behaviors.assert_called_once_with(sensor)
+            self.discover(topic, {"action": "on_press_release"})
+            self.assertEqual(behaviors.call_count, 2)
+
     def test_dimmer_discovery_without_lamps_or_plugs(self):
         self.config["config"]["mqtt"]["discoverLights"] = False
         client = Mock()

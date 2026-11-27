@@ -479,11 +479,12 @@ def on_message(client, userdata, msg):
                                 bridgeConfig["config"]["alarm"]["lasttriggered"] = int(current_time.timestamp())
                         elif device.modelid in standardSensors:
                             conversion = standardSensors[device.modelid]["dataConversion"]
-                            # Battery or link quality messages carry no action
-                            # value; those must not abort the update.
-                            value = data.get(conversion["rootKey"])
-                            if value in conversion:
-                                convertedPayload.update(conversion[value])
+                            action = data.get(conversion["rootKey"])
+                            event = conversion.get(action) if isinstance(action, str) else None
+                            if not isinstance(event, dict) or not event:
+                                # Telemetry must not replay the remote's stored button event.
+                                return
+                            convertedPayload.update(event)
                         # For RDM002: extract rotation direction and route rotary events to ZLLRelativeRotary
                         if "rotaryevent" in convertedPayload:
                             action = data.get("action", "")

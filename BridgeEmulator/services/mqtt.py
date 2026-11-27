@@ -479,8 +479,8 @@ def on_message(client, userdata, msg):
                                 bridgeConfig["config"]["alarm"]["lasttriggered"] = int(current_time.timestamp())
                         elif device.modelid in standardSensors:
                             conversion = standardSensors[device.modelid]["dataConversion"]
-                            action = data.get(conversion["rootKey"])
-                            event = conversion.get(action) if isinstance(action, str) else None
+                            value = data.get(conversion["rootKey"])
+                            event = conversion.get(value) if isinstance(value, (str, bool)) else None
                             if not isinstance(event, dict) or not event:
                                 # Telemetry must not replay the remote's stored button event.
                                 return

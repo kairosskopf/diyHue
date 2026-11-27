@@ -587,6 +587,7 @@ def on_connect(client, userdata, flags, rc):
     refresh_nested_topics(client)
 
 def mqttServer():
+    global discoveryPrefix
 
     logging.info("Starting MQTT service...")
     # ================= MQTT CLIENT Connection========================
@@ -595,8 +596,7 @@ def mqttServer():
     if bridgeConfig["config"]["mqtt"]["mqttUser"] != "" and bridgeConfig["config"]["mqtt"]["mqttPassword"] != "":
         client.username_pw_set(bridgeConfig["config"]["mqtt"]["mqttUser"],bridgeConfig["config"]["mqtt"]["mqttPassword"])
 
-    if bridgeConfig["config"]["mqtt"]['discoveryPrefix'] is not None:
-        discoveryPrefix = bridgeConfig["config"]["mqtt"]['discoveryPrefix']
+    discoveryPrefix = bridgeConfig["config"]["mqtt"].get("discoveryPrefix") or "homeassistant"
     if not bridgeConfig["config"]["mqtt"].get("baseTopic"):
         bridgeConfig["config"]["mqtt"]["baseTopic"] = DEFAULT_Z2M_BASE_TOPIC
 
@@ -621,8 +621,7 @@ def mqttServer():
     # Setup handlers
     client.on_connect = on_connect
     client.on_message = on_message
-    # Connect to the server
-    client.connect(bridgeConfig["config"]["mqtt"]["mqttServer"], bridgeConfig["config"]["mqtt"]["mqttPort"])
-
-    # start the loop to keep receiving data
-    client.loop_forever()
+    # Let the network loop retry even when the broker is offline at bridge startup.
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
+    client.connect_async(bridgeConfig["config"]["mqtt"]["mqttServer"], bridgeConfig["config"]["mqtt"]["mqttPort"])
+    client.loop_forever(retry_first_connection=True)

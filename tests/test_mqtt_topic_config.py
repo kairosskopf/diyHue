@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "BridgeEmulator"))
 
@@ -73,6 +73,31 @@ class MqttBaseTopicTests(unittest.TestCase):
     def test_base_topic_is_stripped_of_slashes(self):
         self.config["config"]["mqtt"]["baseTopic"] = "/hue/"
         self.assertEqual(mqtt.getBaseTopic(), "hue")
+
+    def test_worker_retries_from_startup_and_restores_configured_subscriptions(self):
+        self.config["config"]["mqtt"].update(
+            mqttServer="test-broker", mqttPort=8883, mqttUser="bridge", mqttPassword="test",
+            discoveryPrefix="ha-lab", baseTopic="house/z2m", mqttTls=True,
+            mqttCaCerts="test-ca.pem", mqttCertfile="test-client.pem", mqttKeyfile="test-client.key",
+        )
+        with patch.object(mqtt, "client", autospec=True) as client, \
+                patch.object(mqtt, "discoveryPrefix", "homeassistant"):
+            mqtt.mqttServer()
+            self.assertEqual(client.method_calls, [
+                call.username_pw_set("bridge", "test"),
+                call.tls_set(ca_certs="test-ca.pem", certfile="test-client.pem",
+                             keyfile="test-client.key", tls_version=mqtt.ssl.PROTOCOL_TLS),
+                call.reconnect_delay_set(min_delay=1, max_delay=30),
+                call.connect_async("test-broker", 8883),
+                call.loop_forever(retry_first_connection=True),
+            ])
+            self.assertIs(client.on_message, mqtt.on_message)
+            for _ in range(2):
+                client.reset_mock()
+                client.on_connect(client, None, {}, 0)
+                self.assertCountEqual([c.args[0] for c in client.subscribe.call_args_list],
+                                      ["ha-lab/light/+/light/config", "ha-lab/switch/+/+/config",
+                                       "house/z2m/+", "house/z2m/bridge/devices", "house/z2m/bridge/log"])
 
     def test_subscriptions_use_configured_base_topic(self):
         self.config["config"]["mqtt"]["baseTopic"] = "hue"
